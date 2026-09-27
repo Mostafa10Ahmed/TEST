@@ -1,0 +1,22 @@
+# MangaCleaner GPU Space — requirements.txt
+# Space: mmo9/Inpainting_bot
+
+# Only specify packages not included in the HF Gradio SDK base image
+# to avoid dependency resolution conflicts with the base environment.
+
+# PyTorch & ONNX (LaMa Inpainting & YOLO Text Segmenter)
+torch
+safetensors
+
+ultralytics
+onnxruntime-gpu
+opencv-python-headless
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-cublas-cu12
+nvidia-cufft-cu12
+nvidia-curand-cu12
+nvidia-cusolver-cu12
+nvidia-cusparse-cu12
+nvidia-cudnn-cu12
+easyocr
