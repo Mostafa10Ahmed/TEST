@@ -354,6 +354,22 @@ def build_drive_service():
     return _get_drive_service()
 
 
+def extract_drive_id(url: str) -> Optional[str]:
+    """استخراج أي Drive ID (مجلد أو ملف ZIP) من رابط مشاركة — واجهة عامة لـ _extract_id."""
+    return _extract_id(url)
+
+
+def get_file_metadata(service, file_id: str, fields: str = "id, name, mimeType, size") -> dict:
+    """جلب بيانات ملف/مجلد Drive (الاسم، النوع، الحجم...)."""
+    return service.files().get(fileId=file_id, fields=fields, supportsAllDrives=True).execute()
+
+
+def delete_drive_file(service, file_id: str) -> None:
+    """حذف ملف أو مجلد من Drive نهائياً (وليس مجرد نقله لسلة المهملات) لتحرير مساحة التخزين.
+    حذف مجلد يحذف كل ما بداخله تلقائياً."""
+    service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+
+
 def list_folder_images(service, folder_id: str) -> list:
     files = _list_folder(service, folder_id)
     return [f for f in files if os.path.splitext(f["name"])[1].lower() in SUPPORTED_IMAGES]

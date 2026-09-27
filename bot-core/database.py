@@ -312,6 +312,20 @@ async def init_db():
     """)
     await db.execute("CREATE INDEX IF NOT EXISTS idx_radar_reminders_due ON radar_reminders(fired, notify_at)")
 
+    # ── Drive cleanup jobs (auto-delete temp "تبييض ZIP" output folders) ──
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS drive_cleanup_jobs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            folder_id   TEXT,
+            folder_name TEXT,
+            delete_at   TEXT,
+            done        INTEGER DEFAULT 0,
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_drive_cleanup_due ON drive_cleanup_jobs(done, delete_at)")
+
     # ── Personal Tracker (per-user, guild-independent) ────────────────────
     await db.execute("""
         CREATE TABLE IF NOT EXISTS user_trackers (
@@ -791,6 +805,39 @@ async def get_due_radar_reminders(now_iso: str, limit: int = 50) -> list[tuple]:
 async def mark_radar_reminder_fired(reminder_id: int) -> None:
     db = await _get_db()
     await db.execute("UPDATE radar_reminders SET fired=1 WHERE id=?", (int(reminder_id),))
+    await db.commit()
+
+
+async def add_drive_cleanup_job(
+    user_id: int,
+    folder_id: str,
+    folder_name: str,
+    delete_at_iso: str,
+) -> int:
+    """يسجّل مجلد Drive (تبييض ZIP) لحذفه تلقائياً بعد المهلة المحددة."""
+    db = await _get_db()
+    async with db.execute(
+        "INSERT INTO drive_cleanup_jobs (user_id, folder_id, folder_name, delete_at, done) "
+        "VALUES (?, ?, ?, ?, 0)",
+        (int(user_id), str(folder_id), str(folder_name), str(delete_at_iso)),
+    ) as cursor:
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_due_drive_cleanup_jobs(now_iso: str, limit: int = 20) -> list[tuple]:
+    db = await _get_db()
+    async with db.execute(
+        "SELECT id, user_id, folder_id, folder_name, delete_at "
+        "FROM drive_cleanup_jobs WHERE done=0 AND delete_at <= ? ORDER BY delete_at ASC LIMIT ?",
+        (str(now_iso), int(limit)),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def mark_drive_cleanup_done(job_id: int) -> None:
+    db = await _get_db()
+    await db.execute("UPDATE drive_cleanup_jobs SET done=1 WHERE id=?", (int(job_id),))
     await db.commit()
 
 
@@ -2035,6 +2082,16 @@ async def heal_system() -> dict[str, str | bool | int]:
             "DELETE FROM radar_reminders WHERE fired = 1 OR notify_at < datetime('now', '-7 days')"
         )
         results["orphaned_reminders_cleared"] = cursor.rowcount or 0
+        await db.commit()
+    except Exception:
+        pass
+
+    # 4ب. Clean completed drive cleanup jobs (تبييض ZIP) الأقدم من 7 أيام
+    try:
+        cursor = await db.execute(
+            "DELETE FROM drive_cleanup_jobs WHERE done = 1 OR delete_at < datetime('now', '-7 days')"
+        )
+        results["drive_cleanup_jobs_cleared"] = cursor.rowcount or 0
         await db.commit()
     except Exception:
         pass
