@@ -21,6 +21,7 @@ Enhancements & Fixes:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import io
 import logging
 import os
@@ -35,7 +36,7 @@ from typing import Optional
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import database
 from bot_config import Config
@@ -58,6 +59,9 @@ CHUNK_TIMEOUT  = 60 * 15     # 15 min for large chapters
 DRIVE_RE       = re.compile(
     r"https://drive\.google\.com/(?:drive/folders/|open\?id=)([\w-]+)"
 )
+MAX_ZIP_BATCH        = 10          # أقصى عدد ملفات ZIP في أمر التبييض المتعدد الواحد
+DRIVE_PARALLEL_OPS   = 6           # عدد عمليات التحميل/الرفع المتوازية مع Drive
+ZIP_CLEANUP_HOURS    = 2.0         # مهلة حذف مجلد "تبييض ZIP" تلقائياً من Drive
 
 # Global semaphore — only 1 cleaning job active on server at a time to prevent resource starvation
 CLEANING_SEMAPHORE = asyncio.Semaphore(1)
@@ -71,6 +75,53 @@ def _extract_folder_id(url: str) -> Optional[str]:
     """Extract Google Drive folder ID from a share URL."""
     m = DRIVE_RE.search(url)
     return m.group(1) if m else None
+
+
+def _extract_any_drive_id(url: str) -> Optional[str]:
+    """Extract any Google Drive ID (folder OR file/ZIP) from a share URL."""
+    try:
+        from drive_stitch import extract_drive_id
+        return extract_drive_id(url)
+    except Exception:
+        return _extract_folder_id(url)
+
+
+async def _parallel_drive_ops(items: list, op, concurrency: int = DRIVE_PARALLEL_OPS, on_progress=None) -> None:
+    """
+    ينفّذ op(service, item) على كل عناصر items بشكل متوازٍ باستخدام مجموعة صغيرة
+    من خدمات Drive المستقلة (كل عملية تُنفَّذ بخدمة مخصّصة لها وحدها في لحظتها،
+    عبر طابور موارد) — لأن كائن خدمة Drive (httplib2) غير آمن للمشاركة بين عدة
+    Threads في نفس اللحظة. هذا يستبدل التحميل/الرفع المتسلسل (ملف تلو الآخر)
+    الذي كان السبب الجذري لبطء /clean_manga مع الفصول الكبيرة.
+    """
+    if not items:
+        return
+    from drive_stitch import build_drive_service
+
+    loop = asyncio.get_event_loop()
+    n = max(1, min(concurrency, len(items)))
+    services = await asyncio.gather(*[loop.run_in_executor(None, build_drive_service) for _ in range(n)])
+    pool: asyncio.Queue = asyncio.Queue()
+    for s in services:
+        pool.put_nowait(s)
+
+    done = 0
+    done_lock = asyncio.Lock()
+    total = len(items)
+
+    async def _worker(item):
+        nonlocal done
+        service = await pool.get()
+        try:
+            await loop.run_in_executor(None, lambda: op(service, item))
+        finally:
+            pool.put_nowait(service)
+        async with done_lock:
+            done += 1
+            if on_progress:
+                await on_progress(done, total)
+
+    await asyncio.gather(*[_worker(it) for it in items])
 
 
 def _make_progress_bar(current: int, total: int) -> str:
@@ -104,6 +155,7 @@ def _done_layout_batch(
     total_pages: int,
     elapsed: float,
     total_errors: int,
+    expires_hours: Optional[float] = None,
 ) -> discord.ui.LayoutView:
     """Build the completion layout for a single or multi-chapter cleaning job."""
     layout = discord.ui.LayoutView(timeout=None)
@@ -148,7 +200,14 @@ def _done_layout_batch(
             accessory=btn
         )
         container.add_item(section)
-    
+
+    if expires_hours:
+        container.add_item(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay(
+            f"⚠️ **تنبيه هام**: هذا المجلد مؤقت وسيتم حذفه تلقائياً من Drive بعد "
+            f"**{expires_hours:.0f} ساعة** من الآن — يرجى تحميل/حفظ الملفات الآن."
+        ))
+
     layout.add_item(container)
     return layout
 
@@ -194,16 +253,56 @@ async def _download_drive_folder(
 
     target_files = files[:MAX_IMAGES]
     total = len(target_files)
-    paths = []
 
-    for idx, f in enumerate(target_files):
-        out_path = dest / f["name"]
-        await loop.run_in_executor(None, lambda: download_file(service, f["id"], str(out_path)))
-        paths.append(out_path)
-        if on_progress:
-            await on_progress(len(paths), total)
+    def _download_one(svc, f):
+        download_file(svc, f["id"], str(dest / f["name"]))
 
+    await _parallel_drive_ops(target_files, _download_one, on_progress=on_progress)
+
+    paths = [dest / f["name"] for f in target_files]
     return sorted(paths)
+
+
+async def _get_or_create_user_root_folder(service, user_id: int) -> str:
+    """
+    يبحث عن (أو ينشئ) مجلد التخزين الدائم الخاص بمستخدم معيّن '<user_id>' داخل
+    مجلد التخزين الرئيسي للبوت (Config.GOOGLE_DRIVE_FOLDER_ID)، ليُستخدم كوجهة
+    ثابتة لمخرجات أمري /clean_zip و /clean_zip_multi (بما أن هذين الأمرين لا
+    يأخذان من المستخدم مجلد وجهة، بعكس /clean_manga).
+    """
+    root = Config.GOOGLE_DRIVE_FOLDER_ID
+    if not root:
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID غير مضبوط في إعدادات البوت (.env)")
+
+    loop = asyncio.get_event_loop()
+    name = str(user_id)
+
+    def _find():
+        q = (
+            f"'{root}' in parents and name='{name}' "
+            "and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        )
+        res = service.files().list(
+            q=q, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True
+        ).execute()
+        found = res.get("files", [])
+        return found[0]["id"] if found else None
+
+    existing = await loop.run_in_executor(None, _find)
+    if existing:
+        return existing
+
+    from drive_stitch import create_drive_folder
+    return await loop.run_in_executor(None, lambda: create_drive_folder(service, name, root))
+
+
+async def _schedule_drive_cleanup(user_id: int, folder_id: str, folder_name: str, hours: float = ZIP_CLEANUP_HOURS) -> None:
+    """يسجّل مجلد الإخراج في قاعدة البيانات ليُحذف تلقائياً من Drive بعد `hours` ساعة."""
+    delete_at = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)).isoformat()
+    try:
+        await database.add_drive_cleanup_job(user_id, folder_id, folder_name, delete_at)
+    except Exception as exc:
+        log.warning("Failed to schedule drive cleanup for folder %s: %s", folder_id, exc)
 
 
 async def _create_master_clean_folder(parent_folder_id: str, batch_title: str) -> tuple[str, str]:
@@ -230,11 +329,11 @@ async def _upload_to_drive(
     parent_folder_id: str,
     subfolder_name: str,
     on_progress = None,
-) -> str:
+) -> tuple[str, str]:
     """
     Creates `[Cleaned] {subfolder_name}` subfolder inside `parent_folder_id` in Drive and uploads images.
     Falls back to bot storage folder if target folder lacks write permissions.
-    Returns the web view URL of the new subfolder.
+    Returns (web_view_url, folder_id) of the new subfolder.
     """
     from drive_stitch import build_drive_service, create_drive_folder, upload_file_to_drive
 
@@ -249,13 +348,12 @@ async def _upload_to_drive(
         fallback_parent = Config.GOOGLE_DRIVE_FOLDER_ID or parent_folder_id
         folder_id = await loop.run_in_executor(None, lambda: create_drive_folder(service, clean_name, fallback_parent))
 
-    total = len(images)
-    for idx, img_path in enumerate(images):
-        await loop.run_in_executor(None, lambda: upload_file_to_drive(service, str(img_path), folder_id, img_path.name))
-        if on_progress:
-            await on_progress(idx + 1, total)
+    def _upload_one(svc, img_path):
+        upload_file_to_drive(svc, str(img_path), folder_id, img_path.name)
 
-    return f"https://drive.google.com/drive/folders/{folder_id}"
+    await _parallel_drive_ops(images, _upload_one, on_progress=on_progress)
+
+    return f"https://drive.google.com/drive/folders/{folder_id}", folder_id
 
 
 async def _send_temporary_ping(interaction: discord.Interaction, message_text: str = "تم الانتهاء!"):
@@ -540,6 +638,41 @@ class MangaCleanerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         TEMP_ROOT.mkdir(exist_ok=True)
+        self.drive_cleanup_loop.start()
+
+    def cog_unload(self):
+        self.drive_cleanup_loop.cancel()
+
+    @tasks.loop(minutes=5)
+    async def drive_cleanup_loop(self):
+        """يحذف دورياً مجلدات Drive المؤقتة (نتائج /clean_zip و /clean_zip_multi)
+        التي انتهت مهلتها (ساعتان افتراضياً) لتحرير مساحة تخزين البوت على Drive."""
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            rows = await database.get_due_drive_cleanup_jobs(now, limit=20)
+        except Exception as exc:
+            log.warning("drive_cleanup_loop: failed to fetch due jobs: %s", exc)
+            return
+        if not rows:
+            return
+
+        from drive_stitch import build_drive_service, delete_drive_file
+        loop = asyncio.get_event_loop()
+        service = None
+        for job_id, user_id, folder_id, folder_name, delete_at in rows:
+            try:
+                if service is None:
+                    service = await loop.run_in_executor(None, build_drive_service)
+                await loop.run_in_executor(None, lambda fid=folder_id: delete_drive_file(service, fid))
+                log.info("Auto-deleted expired clean folder '%s' (%s) for user %s", folder_name, folder_id, user_id)
+            except Exception as exc:
+                log.warning("Failed to auto-delete Drive folder %s: %s", folder_id, exc)
+            finally:
+                await database.mark_drive_cleanup_done(job_id)
+
+    @drive_cleanup_loop.before_loop
+    async def _before_drive_cleanup_loop(self):
+        await self.bot.wait_until_ready()
 
     @app_commands.command(name="clean_manga", description="تبييض وتنظيف نصوص المانجا من مجلد Google Drive")
     @app_commands.describe(
@@ -673,6 +806,304 @@ class MangaCleanerCog(commands.Cog):
                     user_system.release_user_lock(user_id)
 
             asyncio.create_task(_run_single_batch())
+
+    @app_commands.command(name="clean_zip", description="تبييض ملف ZIP واحد مرفوع على Google Drive (بدل مجلد صور)")
+    @app_commands.describe(
+        drive_url="رابط ملف ZIP على Google Drive (وليس مجلد) — مثال: https://drive.google.com/file/d/XXXX/view",
+        mode="وضع الجودة (HQ تبييض دقيق | FAST تبييض سريع)",
+        dilate_iter="درجة توسيع الماسك (الافتراضي 3)",
+        sfx_mode="وضع المؤثرات الصوتية (NORMAL عادية | REMOVE_SFX_BETA إزالة المؤثرات للمشرفين)"
+    )
+    @user_only()
+    async def clean_zip_cmd(
+        self,
+        interaction: discord.Interaction,
+        drive_url: str,
+        mode: str = "HQ",
+        dilate_iter: int = 3,
+        sfx_mode: str = "NORMAL",
+    ):
+        user_id = interaction.user.id
+        rank = await user_system.get_rank(user_id)
+
+        allowed_lock, lock_msg = user_system.check_user_cooldown_and_lock(user_id, rank)
+        if not allowed_lock:
+            await interaction.response.send_message(view=_error_layout(lock_msg), ephemeral=True)
+            return
+
+        remove_sfx = False
+        if sfx_mode == "REMOVE_SFX_BETA":
+            if rank < 3:
+                await interaction.response.send_message(
+                    view=_error_layout("❌ وضع إزالة المؤثرات الصوتية (SFX [BETA]) متاح فقط لمالك البوت والمشرفين (Admin) حالياً."),
+                    ephemeral=True
+                )
+                return
+            remove_sfx = True
+
+        allowed, usage_msg = await user_system.check_and_consume_usage(user_id, "clean")
+        if not allowed:
+            await interaction.response.send_message(view=_error_layout(usage_msg), ephemeral=True)
+            return
+
+        file_id = _extract_any_drive_id(drive_url)
+        if not file_id:
+            await interaction.response.send_message(
+                view=_error_layout(
+                    "الرابط غير صحيح!\n"
+                    "يجب أن يكون رابط **ملف ZIP** على Google Drive بصيغة:\n"
+                    "`https://drive.google.com/file/d/XXXX/view`\n"
+                    "(لتبييض مجلد صور كامل استخدم `/clean_manga` بدلاً من ذلك)"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not Config.INPAINTING_SPACE_URL or not Config.INPAINTING_SPACE_KEY:
+            await interaction.response.send_message(
+                view=_error_layout(
+                    "⚙️ لم يُعدّ الـ Inpainting Space بعد.\n"
+                    "يرجى إعداد `INPAINTING_SPACE_URL` و `INPAINTING_SPACE_KEY` في الـ .env"
+                ),
+                ephemeral=True,
+            )
+            return
+        if not Config.GOOGLE_DRIVE_FOLDER_ID:
+            await interaction.response.send_message(
+                view=_error_layout("⚙️ لم يُعدّ مجلد تخزين البوت الرئيسي بعد (`GOOGLE_DRIVE_FOLDER_ID` في الـ .env)."),
+                ephemeral=True,
+            )
+            return
+
+        user_system.acquire_user_lock(user_id)
+        await interaction.response.defer(thinking=True)
+        if usage_msg:
+            try:
+                await interaction.followup.send(content=usage_msg, ephemeral=True)
+            except Exception:
+                pass
+
+        from drive_stitch import build_drive_service, get_file_metadata
+        loop = asyncio.get_event_loop()
+        try:
+            service = await loop.run_in_executor(None, build_drive_service)
+            meta = await loop.run_in_executor(None, lambda: get_file_metadata(service, file_id))
+        except Exception as exc:
+            await interaction.edit_original_response(content=None, view=_error_layout(f"تعذّر الوصول إلى الملف على Drive: {exc}"))
+            user_system.release_user_lock(user_id)
+            return
+
+        meta_name = meta.get("name", "") or ""
+        mime = meta.get("mimeType", "") or ""
+        is_zip = (
+            mime in {"application/zip", "application/x-zip-compressed", "application/octet-stream"}
+            or meta_name.lower().endswith(".zip")
+        )
+        if not is_zip:
+            await interaction.edit_original_response(
+                content=None,
+                view=_error_layout(
+                    "الرابط المُرسَل ليس ملف **ZIP**.\n"
+                    "لتبييض مجلد صور استخدم أمر `/clean_manga` بدلاً من ذلك."
+                ),
+            )
+            user_system.release_user_lock(user_id)
+            return
+
+        zip_title = re.sub(r"\.zip$", "", meta_name, flags=re.IGNORECASE).strip() or "Chapter"
+
+        try:
+            user_root = await _get_or_create_user_root_folder(service, user_id)
+        except Exception as exc:
+            await interaction.edit_original_response(content=None, view=_error_layout(str(exc)))
+            user_system.release_user_lock(user_id)
+            return
+
+        dashboard = DashboardUI(interaction, [{'id': file_id, 'name': zip_title}])
+        await interaction.edit_original_response(content=None, view=dashboard.generate_layout())
+
+        async def _run_single_zip():
+            try:
+                t_start = time.perf_counter()
+                pages, errors, drive_link, folder_id = await self.process_single_zip(
+                    interaction, dashboard, file_id, file_id, zip_title, mode, dilate_iter, remove_sfx, user_root
+                )
+                elapsed = time.perf_counter() - t_start
+
+                if dashboard.is_cancelled:
+                    return
+
+                if folder_id:
+                    await _schedule_drive_cleanup(user_id, folder_id, zip_title)
+
+                layout = _done_layout_batch(
+                    user_mention=interaction.user.mention,
+                    batch_title=zip_title,
+                    drive_link=drive_link or "",
+                    chapters_count=1,
+                    total_pages=pages,
+                    elapsed=elapsed,
+                    total_errors=errors,
+                    expires_hours=ZIP_CLEANUP_HOURS if folder_id else None,
+                )
+                try:
+                    await interaction.channel.send(view=layout)
+                except Exception as exc:
+                    log.warning("Failed to send zip completion card: %s", exc)
+
+                await database.log_event("OK", f"[MangaCleaner-ZIP] cleaned '{zip_title}' ({pages}p) in {elapsed:.0f}s")
+            finally:
+                user_system.release_user_lock(user_id)
+
+        asyncio.create_task(_run_single_zip())
+
+    @app_commands.command(name="clean_zip_multi", description="تبييض متعدد: عدة ملفات ZIP دفعة واحدة من روابط Google Drive")
+    @app_commands.describe(
+        drive_urls="روابط ملفات ZIP على Google Drive، افصل بينها بسطر جديد أو مسافة (حتى 10 ملفات)",
+        mode="وضع الجودة (HQ تبييض دقيق | FAST تبييض سريع)",
+        dilate_iter="درجة توسيع الماسك (الافتراضي 3)",
+        sfx_mode="وضع المؤثرات الصوتية (NORMAL عادية | REMOVE_SFX_BETA إزالة المؤثرات للمشرفين)"
+    )
+    @user_only()
+    async def clean_zip_multi_cmd(
+        self,
+        interaction: discord.Interaction,
+        drive_urls: str,
+        mode: str = "HQ",
+        dilate_iter: int = 3,
+        sfx_mode: str = "NORMAL",
+    ):
+        user_id = interaction.user.id
+        rank = await user_system.get_rank(user_id)
+
+        allowed_lock, lock_msg = user_system.check_user_cooldown_and_lock(user_id, rank)
+        if not allowed_lock:
+            await interaction.response.send_message(view=_error_layout(lock_msg), ephemeral=True)
+            return
+
+        remove_sfx = False
+        if sfx_mode == "REMOVE_SFX_BETA":
+            if rank < 3:
+                await interaction.response.send_message(
+                    view=_error_layout("❌ وضع إزالة المؤثرات الصوتية (SFX [BETA]) متاح فقط لمالك البوت والمشرفين (Admin) حالياً."),
+                    ephemeral=True
+                )
+                return
+            remove_sfx = True
+
+        raw_links = [l for l in re.split(r"[\s,]+", drive_urls.strip()) if l]
+        seen_ids: dict[str, str] = {}
+        for link in raw_links:
+            fid = _extract_any_drive_id(link)
+            if fid and fid not in seen_ids:
+                seen_ids[fid] = link
+        file_ids = list(seen_ids.keys())[:MAX_ZIP_BATCH]
+
+        if not file_ids:
+            await interaction.response.send_message(
+                view=_error_layout(
+                    "لم يتم العثور على أي رابط ملف ZIP صالح على Google Drive.\n"
+                    "أرسل الروابط مفصولة بسطر جديد أو مسافة، مثال:\n"
+                    "`https://drive.google.com/file/d/AAA/view`\n"
+                    "`https://drive.google.com/file/d/BBB/view`"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        allowed, usage_msg = await user_system.check_and_consume_usage(user_id, "clean")
+        if not allowed:
+            await interaction.response.send_message(view=_error_layout(usage_msg), ephemeral=True)
+            return
+
+        if not Config.INPAINTING_SPACE_URL or not Config.INPAINTING_SPACE_KEY:
+            await interaction.response.send_message(
+                view=_error_layout("⚙️ لم يُعدّ الـ Inpainting Space بعد."), ephemeral=True
+            )
+            return
+        if not Config.GOOGLE_DRIVE_FOLDER_ID:
+            await interaction.response.send_message(
+                view=_error_layout("⚙️ لم يُعدّ مجلد تخزين البوت الرئيسي بعد (`GOOGLE_DRIVE_FOLDER_ID` في الـ .env)."),
+                ephemeral=True,
+            )
+            return
+
+        user_system.acquire_user_lock(user_id)
+        await interaction.response.defer(thinking=True)
+        if usage_msg:
+            try:
+                await interaction.followup.send(content=usage_msg, ephemeral=True)
+            except Exception:
+                pass
+
+        from drive_stitch import build_drive_service, get_file_metadata
+        loop = asyncio.get_event_loop()
+        try:
+            service = await loop.run_in_executor(None, build_drive_service)
+        except Exception as exc:
+            await interaction.edit_original_response(content=None, view=_error_layout(f"تعذّر الاتصال بـ Google Drive: {exc}"))
+            user_system.release_user_lock(user_id)
+            return
+
+        items: list[dict] = []
+        skipped = 0
+        for fid in file_ids:
+            try:
+                meta = await loop.run_in_executor(None, lambda fid=fid: get_file_metadata(service, fid))
+            except Exception:
+                skipped += 1
+                continue
+            meta_name = meta.get("name", "") or ""
+            mime = meta.get("mimeType", "") or ""
+            is_zip = (
+                mime in {"application/zip", "application/x-zip-compressed", "application/octet-stream"}
+                or meta_name.lower().endswith(".zip")
+            )
+            if not is_zip:
+                skipped += 1
+                continue
+            title = re.sub(r"\.zip$", "", meta_name, flags=re.IGNORECASE).strip() or f"ZIP {len(items) + 1}"
+            items.append({"id": fid, "name": title})
+
+        if not items:
+            await interaction.edit_original_response(
+                content=None,
+                view=_error_layout("لا يوجد أي رابط صالح لملف ZIP من ضمن الروابط المُرسَلة."),
+            )
+            user_system.release_user_lock(user_id)
+            return
+
+        try:
+            user_root = await _get_or_create_user_root_folder(service, user_id)
+        except Exception as exc:
+            await interaction.edit_original_response(content=None, view=_error_layout(str(exc)))
+            user_system.release_user_lock(user_id)
+            return
+
+        batch_title = f"ZIP Batch ({len(items)})"
+        try:
+            master_id, master_link = await _create_master_clean_folder(user_root, batch_title)
+        except Exception as exc:
+            await interaction.edit_original_response(content=None, view=_error_layout(f"تعذّر إنشاء مجلد الدفعة: {exc}"))
+            user_system.release_user_lock(user_id)
+            return
+
+        dashboard = DashboardUI(interaction, items)
+        skip_note = f"\n⚠️ تم تجاهل {skipped} رابط غير صالح/ليس ملف ZIP." if skipped else ""
+        await interaction.edit_original_response(
+            content=f"🚀 بدء تبييض {len(items)} ملف ZIP (تبييض متعدد)...{skip_note}",
+            view=dashboard.generate_layout()
+        )
+
+        async def _run_zip_batch():
+            try:
+                await self.process_zip_queue(
+                    interaction, dashboard, items, mode, dilate_iter, remove_sfx, master_id, master_link, batch_title
+                )
+            finally:
+                user_system.release_user_lock(user_id)
+
+        asyncio.create_task(_run_zip_batch())
 
     async def process_queue(
         self,
@@ -900,7 +1331,7 @@ class MangaCleanerCog(commands.Cog):
                 )
                 
                 try:
-                    drive_clean_link = await _upload_to_drive(
+                    drive_clean_link, _clean_folder_id = await _upload_to_drive(
                         clean_images, master_folder_id, folder_name, on_progress=on_upload_progress
                     )
                 except Exception as drive_err:
@@ -928,6 +1359,269 @@ class MangaCleanerCog(commands.Cog):
                 for d in (job_dir, clean_dir):
                     if d.exists():
                         shutil.rmtree(d, ignore_errors=True)
+
+    async def process_single_zip(
+        self,
+        interaction: discord.Interaction,
+        dashboard: DashboardUI,
+        item_id: str,
+        file_id: str,
+        zip_title: str,
+        mode: str,
+        dilate_iter: int,
+        remove_sfx: bool,
+        upload_parent_id: str,
+    ) -> tuple[int, int, Optional[str], Optional[str]]:
+        """
+        نفس منطق process_single تماماً، لكن المصدر هنا ملف ZIP مرفوع على Drive
+        بدل مجلد صور — يُستخدم من أمري /clean_zip و /clean_zip_multi.
+        يُرجع (pages, errors, drive_link, created_folder_id).
+        """
+        job_id    = uuid.uuid4().hex[:8]
+        job_dir   = TEMP_ROOT / f"zipjob_{job_id}"
+        clean_dir = TEMP_ROOT / f"zipclean_{job_id}"
+        pages     = 0
+        errors    = 0
+
+        async with CLEANING_SEMAPHORE:
+            try:
+                async def _update(title: str, desc: str, colour: discord.Color = C_BLUE, progress_bar: str = None, force: bool = False):
+                    if not progress_bar:
+                        progress_bar = f"`{'▱' * 15} 0%`  ·  جاري العمل..."
+                    await dashboard.update(item_id, f"{title}: {desc}", progress_bar, force=force)
+
+                # ── Step 1 — Download & extract the ZIP from Drive ──────
+                await _update(
+                    "📥 جاري التحميل", "يتم تحميل ملف الـZIP من Drive...",
+                    colour=C_BLUE, progress_bar=_make_progress_bar(0, 100), force=True
+                )
+
+                job_dir.mkdir(parents=True, exist_ok=True)
+                from drive_stitch import build_drive_service, download_file
+                loop = asyncio.get_event_loop()
+                service = await loop.run_in_executor(None, build_drive_service)
+
+                zip_local_path = job_dir / "source.zip"
+                await loop.run_in_executor(None, lambda: download_file(service, file_id, str(zip_local_path)))
+
+                extract_dir = job_dir / "extracted"
+                extract_dir.mkdir(parents=True, exist_ok=True)
+
+                def _extract():
+                    with zipfile.ZipFile(zip_local_path) as zf:
+                        zf.extractall(extract_dir)
+                    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+                    return sorted(p for p in extract_dir.rglob("*.*") if p.suffix.lower() in exts)
+
+                images = await loop.run_in_executor(None, _extract)
+                images = images[:MAX_IMAGES]
+
+                if not images:
+                    await dashboard.update(item_id, "❌ خطأ: لا توجد صور صالحة داخل ملف الـZIP", force=True)
+                    return 0, 1, None, None
+
+                if dashboard.is_cancelled: return 0, 0, None, None
+
+                # ── Step 2 — Pack into ZIP ────────────
+                await _update(
+                    f"📦 تعبئة {len(images)} صورة",
+                    "يتم ضغط الصور وإرسالها للمعالجة.",
+                    colour=C_BLUE,
+                    progress_bar=_make_progress_bar(len(images), len(images)),
+                    force=True
+                )
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_STORED) as zf:
+                    for img_path in images:
+                        zf.write(img_path, img_path.name)
+                zip_bytes = zip_buf.getvalue()
+
+                if dashboard.is_cancelled: return 0, 0, None, None
+
+                # ── Step 3 — Send to Inpainting Space ─
+                yolo_lama_bar = f"`{'▰' * 9}{'▱' * 6} 60%`  ·  جاري المعالجة..."
+                await _update(
+                    "🤖 AI يعالج النصوص",
+                    f"يتم إزالة النصوص بجودة {mode}...",
+                    colour=C_BLUE,
+                    progress_bar=yolo_lama_bar,
+                    force=True
+                )
+
+                connector = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    clean_zip_bytes, pages, errors, ai_elapsed = await _send_to_inpainting_space(
+                        zip_bytes, mode, session, dilate_iter, remove_sfx
+                    )
+
+                if dashboard.is_cancelled: return pages, errors, None, None
+
+                # ── Step 4 — Extract cleaned images ───
+                extract_bar = f"`{'▰' * 12}{'▱' * 3} 80%`  ·  جاري استخراج الصور المبيّضة..."
+                await _update(
+                    "📦 استخراج الصور المعالجة",
+                    "يتم تحضير الصور المستلمة للرفع.",
+                    colour=C_BLUE,
+                    progress_bar=extract_bar,
+                    force=True
+                )
+                clean_dir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(clean_zip_bytes)) as czf:
+                    czf.extractall(clean_dir)
+                clean_images = sorted(clean_dir.rglob("*.*"))
+                clean_images = [p for p in clean_images if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}]
+
+                if dashboard.is_cancelled: return pages, errors, None, None
+
+                # ── Step 5 — Upload to Drive (مجلد المستخدم الدائم) ───
+                last_update_time = 0.0
+                async def on_upload_progress(current, total):
+                    nonlocal last_update_time
+                    now = time.time()
+                    if now - last_update_time >= 1.5 or current == total:
+                        last_update_time = now
+                        bar = _make_progress_bar(current, total)
+                        await _update("☁️ رفع الصور النظيفة", "يتم رفع الصور المعالجة إلى Google Drive.", colour=C_BLUE, progress_bar=bar)
+
+                await _update(
+                    "☁️ رفع الصور النظيفة",
+                    f"يتم رفع {len(clean_images)} صورة...",
+                    colour=C_BLUE,
+                    progress_bar=_make_progress_bar(0, len(clean_images)),
+                    force=True
+                )
+
+                created_folder_id = None
+                drive_clean_link = None
+                try:
+                    drive_clean_link, created_folder_id = await _upload_to_drive(
+                        clean_images, upload_parent_id, zip_title, on_progress=on_upload_progress
+                    )
+                except Exception as drive_err:
+                    log.warning("Drive upload failed for %s (non-fatal): %s", zip_title, drive_err)
+
+                # ── Step 6 — Done ──────────────
+                err_desc = f" (تخطي {errors} أخطاء)" if errors else ""
+                await dashboard.update(
+                    item_id,
+                    f"✅ اكتمل التبييض{err_desc}",
+                    f"`{'▰' * 15} 100%`  ·  `{pages}/{pages}` صفحة",
+                    drive_link=drive_clean_link,
+                    force=True
+                )
+
+                return pages, errors, drive_clean_link, created_folder_id
+
+            except Exception as exc:
+                log.exception("clean_zip job %s failed: %s", job_id, exc)
+                await dashboard.update(item_id, f"❌ خطأ: {exc}", force=True)
+                await database.log_event("ERROR", f"[MangaCleaner-ZIP] job {job_id}: {exc}")
+                return 0, 1, None, None
+            finally:
+                for d in (job_dir, clean_dir):
+                    if d.exists():
+                        shutil.rmtree(d, ignore_errors=True)
+
+    async def process_zip_queue(
+        self,
+        interaction: discord.Interaction,
+        dashboard: DashboardUI,
+        items: list[dict],
+        mode: str,
+        dilate_iter: int,
+        remove_sfx: bool,
+        master_id: str,
+        master_link: str,
+        batch_title: str,
+    ):
+        """معالجة دفعة ملفات ZIP لأمر /clean_zip_multi — كلها تُرفَع داخل مجلد
+        دفعة واحد (master_id) في مساحة تخزين المستخدم الخاصة، ويُجدوَل حذفه
+        تلقائياً مرة واحدة فقط بعد اكتمال الدفعة بالكامل."""
+        user_id = interaction.user.id
+        rank = await user_system.get_rank(user_id)
+        inter_delay = 3 if rank >= 2 else 8
+
+        total_pages_all = 0
+        total_errors_all = 0
+        t_start_batch = time.perf_counter()
+        any_uploaded = False
+
+        for idx, item in enumerate(items):
+            if dashboard.is_cancelled:
+                log.info("ZIP batch job cancelled by user %s", user_id)
+                break
+
+            if idx > 0:
+                allowed_ch, credit_msg = await user_system.check_and_consume_usage(user_id, "clean")
+                if not allowed_ch:
+                    log.warning("User %s ran out of credits/trial at zip index %s (%s)", user_id, idx, item['name'])
+                    await dashboard.update(item['id'], f"❌ توقفت العملية (نفاد الرصيد): {credit_msg}", force=True)
+                    try:
+                        await interaction.followup.send(
+                            content=(
+                                f"⚠️ {interaction.user.mention} توقفت عملية التبييض المتعدد عند "
+                                f"`{item['name']}` بسبب نفاد رصيد نقاطك أو حدك اليومي المتاح.\n"
+                                "تم حفظ نتائج الملفات الناجحة السابقة بنجاح."
+                            ),
+                            ephemeral=True
+                        )
+                    except Exception:
+                        pass
+                    break
+
+            if idx > 0 and not dashboard.is_cancelled:
+                for sec in range(inter_delay, 0, -1):
+                    if dashboard.is_cancelled:
+                        break
+                    await dashboard.update(item['id'], f"⏳ مهلة انتظار قبل الملف التالي ({sec}ث)...", force=True)
+                    await asyncio.sleep(1)
+
+            if dashboard.is_cancelled:
+                break
+
+            pages, errors, item_link, _folder_id = await self.process_single_zip(
+                interaction, dashboard, item['id'], item['id'], item['name'], mode, dilate_iter, remove_sfx, master_id
+            )
+            total_pages_all += pages
+            total_errors_all += errors
+            if item_link:
+                any_uploaded = True
+
+        elapsed_total = time.perf_counter() - t_start_batch
+
+        if dashboard.is_cancelled:
+            await dashboard.update(items[0]['id'], "🛑 تم إلغاء عملية التبييض", force=True)
+            return
+
+        await dashboard.update(
+            items[-1]['id'],
+            "✅ اكتمل التبييض بنجاح",
+            f"`{'▰' * 15} 100%`",
+            drive_link=master_link,
+            force=True
+        )
+
+        if any_uploaded:
+            await _schedule_drive_cleanup(user_id, master_id, batch_title)
+
+        layout = _done_layout_batch(
+            user_mention=interaction.user.mention,
+            batch_title=batch_title,
+            drive_link=master_link,
+            chapters_count=len(items),
+            total_pages=total_pages_all,
+            elapsed=elapsed_total,
+            total_errors=total_errors_all,
+            expires_hours=ZIP_CLEANUP_HOURS if any_uploaded else None,
+        )
+        try:
+            await interaction.channel.send(view=layout)
+        except Exception as exc:
+            log.warning("Failed to send zip-batch completion card: %s", exc)
+
+        await database.log_event(
+            "OK", f"[MangaCleaner-ZIP] Batch cleaned {len(items)} zip(s) ({total_pages_all}p) in {elapsed_total:.0f}s"
+        )
 
 
 async def setup(bot: commands.Bot):
