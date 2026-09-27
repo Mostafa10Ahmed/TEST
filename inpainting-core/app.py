@@ -239,6 +239,15 @@ MAX_ZIP_MB     = int(os.getenv("MAX_ZIP_MB",       "500"))
 # Minimum connected component area (px²) to keep — removes screentone/noise dots
 MIN_COMP_AREA  = int(os.getenv("MIN_COMP_AREA",   "20"))
 
+# ── Art-protection routing thresholds (see _route_text_masks) ──────────────
+# تُستخدم لفصل المناطق الآمنة للتعبئة الكاملة (خلفية فقاعة مسطحة فاتحة) عن
+# المناطق الحساسة (نص حر/SFX فوق الرسم أو خلفية متدرجة) التي يجب فيها اتّباع
+# شكل الحبر بدقة بدل ملء صندوق كامل — لحماية رسم الشخصيات من "الأكل".
+SAFE_BUBBLE_BORDER     = int(os.getenv("SAFE_BUBBLE_BORDER", "5"))
+UNIFORM_LIGHT_STD      = float(os.getenv("UNIFORM_LIGHT_STD", "12.0"))
+UNIFORM_LIGHT_GRADIENT = float(os.getenv("UNIFORM_LIGHT_GRADIENT", "8.0"))
+COMPLEX_FEATHER_RADIUS = float(os.getenv("COMPLEX_FEATHER_RADIUS", "2.5"))
+
 # Global model handles
 yolo_model: Optional[YOLO] = None
 comic_det_session: Optional[ort.InferenceSession] = None
@@ -828,12 +837,321 @@ def _build_comic_detector_mask(image_bgr: np.ndarray) -> np.ndarray:
     return hybrid_mask
 
 
-def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bool = False) -> np.ndarray:
+def _dilation_iterations(dilate_iter: int) -> int:
+    """يحوّل قيمة dilate_iter (1-15 من سلايدر البوت/الـ Space) إلى عدد مرات توسيع فعلي.
+    القيمة الافتراضية 3 تُعطي iterations=1 (تطابق تماماً السلوك القديم قبل هذا التعديل
+    لضمان التوافق العكسي). القيم الأقل تُقلّل التوسيع لحماية رسم الشخصيات (تصل لصفر
+    توسيع عند 1)، والقيم الأعلى تزيده تدريجياً حتى 5 عند 15 للصفحات الصعبة."""
+    d = max(1, min(15, int(dilate_iter)))
+    return max(0, round((d - 1) * (5.0 / 14.0)))
+
+
+# ──────────────────────────────────────────────
+# Art-Protection Routing Helpers
+# ──────────────────────────────────────────────
+# تفصل هذه الدوال بين مناطق آمنة 100% للتعبئة الكاملة (خلفية فقاعة كلام مسطحة
+# وفاتحة) ومناطق حساسة يجب فيها اتّباع شكل الحبر فقط بدل مستطيل كامل حتى لا
+# يُمسح جزء من رسم الشخصية — وهو ما يحدث كثيراً مع الـSFX/النص الحر في
+# المانهوا الكورية المرسوم مباشرة فوق الرسم بدون فقاعة كلام حقيقية.
+
+def _safe_bubble_interior(
+    interior_mask, safe_border: int = SAFE_BUBBLE_BORDER
+):
+    """يقلّص منطقة داخل الفقاعة/الصندوق بمقدار حدّ أمان (بكسل) بعيداً عن حافتها
+    الخارجية، حتى لا تُعامَل حافة الفقاعة أو خط الإطار نفسه كخلفية آمنة للتعبئة."""
+    if interior_mask is None or interior_mask.max() == 0:
+        return interior_mask
+    k = max(1, int(safe_border))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+    return cv2.erode(interior_mask, kernel, iterations=1, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _component_background_is_uniform_light(
+    image_bgr: np.ndarray,
+    mask_component: np.ndarray,
+    std_thresh: float = UNIFORM_LIGHT_STD,
+    grad_thresh: float = UNIFORM_LIGHT_GRADIENT,
+) -> bool:
+    """يفحص إن كانت الخلفية المحيطة بقطعة نص واحدة مسطحة وفاتحة (فقاعة كلام
+    عادية بيضاء) → آمن نملأها بالكامل. أي تدرج لوني أو خلفية داكنة/رسم تُرجع
+    False (منطقة حساسة يجب حمايتها)."""
+    ys, xs = np.where(mask_component > 0)
+    if ys.size == 0:
+        return False
+    h, w = mask_component.shape[:2]
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    pad = max(6, (x1 - x0) // 2, (y1 - y0) // 2)
+    ry0, ry1 = max(0, y0 - pad), min(h, y1 + pad + 1)
+    rx0, rx1 = max(0, x0 - pad), min(w, x1 + pad + 1)
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    region = gray[ry0:ry1, rx0:rx1]
+    region_mask = mask_component[ry0:ry1, rx0:rx1]
+    bg = region[region_mask == 0]
+    if bg.size < 8:
+        bg = region.reshape(-1)
+
+    mean_val = float(bg.mean())
+    std_val = float(bg.std())
+
+    mid = region.shape[1] // 2
+    left_mean = float(region[:, :mid].mean()) if mid > 0 else mean_val
+    right_mean = float(region[:, mid:].mean()) if region.shape[1] - mid > 0 else mean_val
+    grad_h = abs(right_mean - left_mean)
+
+    midy = region.shape[0] // 2
+    top_mean = float(region[:midy, :].mean()) if midy > 0 else mean_val
+    bot_mean = float(region[midy:, :].mean()) if region.shape[0] - midy > 0 else mean_val
+    grad_v = abs(bot_mean - top_mean)
+
+    is_light = mean_val >= 150.0
+    is_flat = std_val <= std_thresh and max(grad_h, grad_v) <= grad_thresh
+    return bool(is_light and is_flat)
+
+
+def _find_system_panel_interior(image_bgr: np.ndarray, text_mask: np.ndarray) -> np.ndarray:
+    """يكشف صناديق الواجهة/النظام ذات الحدّ (System Window/Status Box الشائعة في
+    مانهوا الرجعة/الشخصية القوية) القريبة من نص مكتشف، ويُرجع قناع "الداخل" فقط
+    بدون خط الإطار، حتى لا يتضرر تصميم الصندوق نفسه أثناء التبييض."""
+    h, w = image_bgr.shape[:2]
+    result = np.zeros((h, w), dtype=np.uint8)
+    if text_mask is None or text_mask.max() == 0:
+        return result
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.where(text_mask > 0)
+    ty0, ty1 = int(ys.min()), int(ys.max())
+    tx0, tx1 = int(xs.min()), int(xs.max())
+
+    pad = 60
+    sy0, sy1 = max(0, ty0 - pad), min(h, ty1 + pad)
+    sx0, sx1 = max(0, tx0 - pad), min(w, tx1 + pad)
+    roi = gray[sy0:sy1, sx0:sx1]
+    if roi.size == 0:
+        return result
+
+    _, th = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+    for candidate in (cv2.bitwise_not(th), th):
+        contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            if bw < 20 or bh < 20:
+                continue
+            area_ratio = cv2.contourArea(cnt) / float(bw * bh)
+            if area_ratio < 0.6:
+                continue
+            box_x0, box_y0 = sx0 + x, sy0 + y
+            box_x1, box_y1 = box_x0 + bw, box_y0 + bh
+            if not (box_x0 <= tx0 and box_y0 <= ty0 and box_x1 >= tx1 and box_y1 >= ty1):
+                continue
+
+            border = 4
+            inner_x0 = min(w, box_x0 + border)
+            inner_y0 = min(h, box_y0 + border)
+            inner_x1 = max(0, box_x1 - border)
+            inner_y1 = max(0, box_y1 - border)
+            if inner_x1 <= inner_x0 or inner_y1 <= inner_y0:
+                continue
+            cv2.rectangle(result, (inner_x0, inner_y0), (inner_x1 - 1, inner_y1 - 1), 255, -1)
+            return result
+
+    return result
+
+
+def _route_text_masks(
+    image_bgr: np.ndarray, mask: np.ndarray, interior
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """يفرز قناع النص المكتشف إلى 3 أقنعة، قطعة متصلة بقطعة:
+      legacy   → آمنة للتعبئة الكاملة (خلفية فقاعة مسطحة فاتحة)
+      complex  → حساسة (تدرج/خلفية غير مسطحة أو رسم) تحتاج تتبّع شكل الحبر بدقة
+      excluded → قريبة جداً من حافة الفقاعة/الصندوق فتُستبعد كلياً لحماية الإطار
+    """
+    h, w = mask.shape[:2]
+    legacy = np.zeros((h, w), dtype=np.uint8)
+    complex_mask = np.zeros((h, w), dtype=np.uint8)
+    excluded = np.zeros((h, w), dtype=np.uint8)
+
+    if mask is None or mask.max() == 0:
+        return legacy, complex_mask, excluded
+
+    safe_interior = None
+    if interior is not None and interior.max() > 0:
+        safe_interior = _safe_bubble_interior(interior, SAFE_BUBBLE_BORDER)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 1:
+            continue
+        comp = np.zeros((h, w), dtype=np.uint8)
+        comp[labels == i] = 255
+
+        if safe_interior is not None:
+            outside = cv2.bitwise_and(comp, cv2.bitwise_not(safe_interior))
+            if cv2.countNonZero(outside) > 0:
+                excluded = cv2.bitwise_or(excluded, outside)
+                comp = cv2.bitwise_and(comp, safe_interior)
+                if cv2.countNonZero(comp) == 0:
+                    continue
+
+        if _component_background_is_uniform_light(image_bgr, comp):
+            legacy = cv2.bitwise_or(legacy, comp)
+        else:
+            complex_mask = cv2.bitwise_or(complex_mask, comp)
+
+    return legacy, complex_mask, excluded
+
+
+def _has_new_boundary_artifact(
+    source: np.ndarray, candidate: np.ndarray, mask: np.ndarray, threshold: float = 40.0
+) -> bool:
+    """يقارن حدّة الحواف حول منطقة معيّنة قبل/بعد التبييض؛ لو التبييض أدخل حافة
+    صناعية جديدة وحادة لم تكن موجودة أصلاً (مؤشر على تشويه/أكل جزء من الرسم)
+    يُرجع True."""
+    if mask is None or mask.max() == 0:
+        return False
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dil = cv2.dilate(mask, k, iterations=1)
+    ring = cv2.bitwise_and(dil, cv2.bitwise_not(mask))
+    if cv2.countNonZero(ring) == 0:
+        return False
+
+    # ملاحظة: الصور هنا قد تكون بترتيب RGB أو BGR — التحويل لرمادي بأي من
+    # الترتيبين يعطي طاقة حواف مكافئة عملياً (فرق أوزان القنوات لا يؤثر على
+    # اكتشاف حدّة الانتقال)، فلا حاجة لتحويل إضافي هنا.
+    src_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    cand_gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    src_edges = cv2.Laplacian(src_gray, cv2.CV_32F, ksize=3)
+    cand_edges = cv2.Laplacian(cand_gray, cv2.CV_32F, ksize=3)
+
+    ring_bool = ring > 0
+    src_energy = float(np.abs(src_edges[ring_bool]).mean())
+    cand_energy = float(np.abs(cand_edges[ring_bool]).mean())
+    return bool((cand_energy - src_energy) > threshold)
+
+
+def _blend_complex_result(
+    source: np.ndarray, restored: np.ndarray, mask: np.ndarray, feather_radius: float = COMPLEX_FEATHER_RADIUS
+) -> np.ndarray:
+    """يدمج نتيجة الاستعادة مع الأصل بتلاشٍ ناعم داخل القناع فقط، مع ضمان عدم
+    تغيّر أي بكسل خارج القناع إطلاقاً."""
+    if mask is None or mask.max() == 0:
+        return source.copy()
+    mask_bin = (mask > 0).astype(np.uint8)
+    dist = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 3)
+    radius = max(0.5, float(feather_radius))
+    weight = np.clip(dist / radius, 0.0, 1.0)
+    weight = weight * weight * (3.0 - 2.0 * weight)
+    weight_3ch = np.stack([weight] * source.shape[2], axis=-1) if source.ndim == 3 else weight
+
+    blended = weight_3ch * restored.astype(np.float32) + (1.0 - weight_3ch) * source.astype(np.float32)
+    blended = np.clip(blended, 0, 255).astype(source.dtype)
+
+    out = source.copy()
+    out[mask_bin > 0] = blended[mask_bin > 0]
+    return out
+
+
+def _guard_complex_regions(
+    source_rgb: np.ndarray, candidate_rgb: np.ndarray, complex_mask: np.ndarray
+) -> np.ndarray:
+    """طبقة حماية أخيرة بعد التبييض: تتحقق -قطعة بقطعة- من عدم ظهور حافة صناعية
+    جديدة داخل المناطق الحساسة (نص حر فوق رسم/خلفية متدرجة)، وتستعيد بكسلات
+    الأصل عند الشك بدل المجازفة بتشويه أو أكل جزء من رسم الشخصية."""
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((complex_mask > 0).astype(np.uint8), connectivity=8)
+    out = candidate_rgb
+    reverted = 0
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 1:
+            continue
+        comp = np.zeros(complex_mask.shape, dtype=np.uint8)
+        comp[labels == i] = 255
+        if _has_new_boundary_artifact(source_rgb, candidate_rgb, comp):
+            out[comp > 0] = source_rgb[comp > 0]
+            reverted += 1
+    if reverted:
+        log.info("Guard: reverted %d suspicious region(s) to protect artwork from a bad inpaint.", reverted)
+    return out
+
+
+def _extract_precise_text_mask(image_bgr: np.ndarray, mask: np.ndarray, c_constant: int = C_CONSTANT) -> np.ndarray:
+    """يحوّل صندوق الكاشف الخشن إلى قناع دقيق يغطي حبر النص الفعلي فقط (لا
+    المستطيل كاملاً)، لحماية الرسم أو الخلفية المتدرجة المحيطة بالنص من المسح
+    غير المقصود. يُستخدم للمناطق "الحساسة" فقط (انظر _route_text_masks)."""
+    if mask is None or mask.max() == 0:
+        return mask
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.where(mask > 0)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+
+    region = gray[y0:y1 + 1, x0:x1 + 1]
+    region_mask = mask[y0:y1 + 1, x0:x1 + 1]
+
+    # حجم نافذة محلي معقول لعزل الحبر عن الخلفية بغض النظر عن اتساع صندوق الكشف الكلي
+    block = max(3, min(51, (min(region.shape) // 2) | 1))
+
+    try:
+        thresh_dark = cv2.adaptiveThreshold(
+            region, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, c_constant
+        )
+    except cv2.error:
+        thresh_dark = np.zeros_like(region)
+
+    precise_region = cv2.bitwise_and(thresh_dark, region_mask)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(precise_region, connectivity=8)
+    cleaned = np.zeros_like(precise_region)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= MIN_COMP_AREA:
+            cleaned[labels == i] = 255
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    cleaned = cv2.dilate(cleaned, k, iterations=1)
+
+    if cv2.countNonZero(cleaned) == 0:
+        # لم تُميّز العتبة التكيفية أي حبر (تباين ضعيف جداً) → القناع الأصلي كحل احتياطي آمن
+        return mask
+
+    out = np.zeros_like(mask)
+    out[y0:y1 + 1, x0:x1 + 1] = cleaned
+    return out
+
+
+def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """يبني قناع النص النهائي المطلوب تبييضه.
+    يُرجع (final_mask, complex_guard_mask):
+      final_mask         → القناع الكامل المُمرَّر إلى LaMa للتبييض.
+      complex_guard_mask → الجزء "الحساس" فقط (نص حر فوق رسم/خلفية متدرجة)
+                            يُستخدم لاحقاً للتحقق من عدم ظهور حافة صناعية بعد
+                            التبييض (حماية إضافية — انظر _guard_complex_regions).
+    """
     h, w = image_bgr.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
 
     # 1. Run ComicTextDetector ONNX (Primary specialized detector)
     comic_mask = _build_comic_detector_mask(image_bgr)
+
+    # مناطق آمنة معروفة (داخل فقاعات كلام حقيقية + صناديق نظام) — تُستخدم لبوابة
+    # الـSFX ولاحقاً لفرز المناطق الآمنة عن الحساسة في الخطوة 5
+    bubble_interior = _build_bubble_interior_mask(image_bgr)
+    panel_interior = (
+        _find_system_panel_interior(image_bgr, comic_mask)
+        if comic_mask.max() > 0
+        else np.zeros((h, w), dtype=np.uint8)
+    )
+    safe_interior = cv2.bitwise_or(bubble_interior, panel_interior)
+
+    # بوابة SFX: الـComicTextDetector لا يُميّز نوع النص (حوار/SFX)، فأي كشف
+    # يقع خارج أي فقاعة كلام أو صندوق نظام فعلي يُعامَل كأثر صوتي/عنوان حر
+    # ويُستبعد عندما لا يطلب المستخدم صراحة إزالة الـSFX (remove_sfx=False)
+    if not remove_sfx and safe_interior.max() > 0:
+        gate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        gate = cv2.dilate(safe_interior, gate_kernel, iterations=1)
+        comic_mask = cv2.bitwise_and(comic_mask, gate)
+
     mask = cv2.bitwise_or(mask, comic_mask)
 
     # 2. Run YOLOv8 text segmenter pass (Ensemble detector)
@@ -931,30 +1249,54 @@ def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bo
     h_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 5))
     bridged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, h_bridge)
 
-    # 5. Adaptive Line Envelope & Halo Dilation for Titles & SFX
-    contours, _ = cv2.findContours(bridged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 5. توجيه المناطق: آمنة (Line Envelope الكامل كالسابق) مقابل حساسة (تتبّع
+    # دقيق لشكل الحبر بدل صندوق كامل) — هذا هو ما يحمي رسم الشخصيات من "الأكل"،
+    # خصوصاً في صفحات المانهوا الكورية حيث يُرسم الـSFX/النص الحر فوق الرسم
+    # مباشرة بدون فقاعة كلام واضحة.
+    legacy_mask, complex_mask, _excluded = _route_text_masks(image_bgr, bridged, safe_interior)
+
+    iterations = _dilation_iterations(dilate_iter)
     refined_mask = np.zeros_like(mask)
-    for cnt in contours:
-        x, y_box, bw, bh = cv2.boundingRect(cnt)
-        if bw < 4 or bh < 4:
-            continue
-        
-        # For large stylized titles/narration (width > 80 or height > 35), use line envelope rectangle to guarantee 100% removal
-        if bw > 80 or bh > 35:
-            pad = 8
-            x0, y0 = max(0, x - pad), max(0, y_box - pad)
-            x1, y1 = min(w, x + bw + pad), min(h, y_box + bh + pad)
-            cv2.rectangle(refined_mask, (x0, y0), (x1, y1), 255, -1)
-        else:
-            cnt_mask = np.zeros_like(mask)
-            cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            dil = cv2.dilate(cnt_mask, k, iterations=1)
-            refined_mask = cv2.bitwise_or(refined_mask, dil)
+
+    # 5أ. المناطق الآمنة (خلفية فقاعة مسطحة وفاتحة): نفس منطق "Line Envelope"
+    # القديم تماماً — تعبئة مستطيلية مضمونة 100% للعناوين/الأسطر الكبيرة،
+    # وتوسيع بيضاوي للنصوص الصغيرة (بقوة dilate_iter بدل iterations=1 ثابتة).
+    if legacy_mask.max() > 0:
+        contours, _ = cv2.findContours(legacy_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y_box, bw, bh = cv2.boundingRect(cnt)
+            if bw < 4 or bh < 4:
+                continue
+
+            # For large stylized titles/narration (width > 80 or height > 35), use line envelope rectangle to guarantee 100% removal
+            if bw > 80 or bh > 35:
+                pad = 8
+                x0, y0 = max(0, x - pad), max(0, y_box - pad)
+                x1, y1 = min(w, x + bw + pad), min(h, y_box + bh + pad)
+                cv2.rectangle(refined_mask, (x0, y0), (x1, y1), 255, -1)
+            else:
+                cnt_mask = np.zeros_like(mask)
+                cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                dil = cnt_mask if iterations <= 0 else cv2.dilate(cnt_mask, k, iterations=iterations)
+                refined_mask = cv2.bitwise_or(refined_mask, dil)
+
+    # 5ب. المناطق الحساسة (تدرج/خلفية غير مسطحة أو نص فوق الرسم مباشرة): نتبع
+    # شكل حبر النص الفعلي بدقة (adaptive threshold) بدل ملء الصندوق الخشن
+    # بالكامل، ثم هالة صغيرة بقوة dilate_iter فقط — حماية مباشرة لرسم الشخصية
+    # المجاور بدل مستطيل قد يبتلع جزءاً من الوجه/اليد.
+    complex_guard_mask = np.zeros_like(mask)
+    if complex_mask.max() > 0:
+        precise = _extract_precise_text_mask(image_bgr, complex_mask, C_CONSTANT)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        precise_dilated = precise if iterations <= 0 else cv2.dilate(precise, k, iterations=iterations)
+        refined_mask = cv2.bitwise_or(refined_mask, precise_dilated)
+        complex_guard_mask = precise_dilated
 
     # Re-apply scanlation watermark filter to ensure credit badge safety
     refined_mask = _filter_scanlation_watermarks(refined_mask, w, h)
-    return refined_mask
+    complex_guard_mask = cv2.bitwise_and(complex_guard_mask, refined_mask)
+    return refined_mask, complex_guard_mask
 
 
 def _hybrid_inpaint(img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -1092,11 +1434,6 @@ def _lama_inpaint_tile(img_rgb: np.ndarray, mask: np.ndarray, size: int = 512) -
     return img_out
 
 
-def _extract_precise_text_mask(img_rgb: np.ndarray, mask: np.ndarray, c_constant: int = C_CONSTANT) -> np.ndarray:
-    """Refines text masks into pixel-perfect stroke masks while protecting character line art."""
-    return mask
-
-
 def _cpu_fallback_cleaner(img_bgr: np.ndarray) -> np.ndarray:
     """Safe CPU fallback: Returns original image without destructive Telea inpainting."""
     return img_bgr
@@ -1120,11 +1457,16 @@ def clean_single_image_helper(
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        # Build comprehensive text mask
-        text_mask = _build_text_mask(img_bgr, dilate_iter=dilate_iter, remove_sfx=remove_sfx)
+        # Build comprehensive text mask (+ قناع المناطق الحساسة لحماية الرسم)
+        text_mask, complex_guard_mask = _build_text_mask(img_bgr, dilate_iter=dilate_iter, remove_sfx=remove_sfx)
 
         if text_mask.max() > 0:
             img_clean = _hybrid_inpaint(img_rgb, text_mask)
+            # طبقة حماية أخيرة: لو ظهرت حافة صناعية جديدة داخل منطقة حساسة
+            # (نص حر فوق رسم)، نستعيد بكسلات الأصل لتلك القطعة تحديداً بدل
+            # المجازفة بتشويه/أكل جزء من رسم الشخصية
+            if complex_guard_mask is not None and complex_guard_mask.max() > 0:
+                img_clean = _guard_complex_regions(img_rgb, img_clean, complex_guard_mask)
         else:
             img_clean = img_rgb.copy()
 
