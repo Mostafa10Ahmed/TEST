@@ -1,0 +1,88 @@
+{
+  "booklive.jp": {
+    "template": "speedbinb",
+    "url": "https://booklive.jp",
+    "path": "/list/"
+  },
+  "cmoa.jp": {
+    "template": "speedbinb",
+    "url": "https://www.cmoa.jp",
+    "path": "/list/"
+  },
+  "comic-brise.com": {
+    "template": "speedbinb",
+    "url": "https://www.comic-brise.com",
+    "path": "/list/"
+  },
+  "hobbyjapan.co.jp/comic": {
+    "template": "speedbinb",
+    "url": "https://www.hobbyjapan.co.jp/comic",
+    "path": "/list/",
+    "selectors": {
+      "queryChapters": "li.pconly h3 a"
+    }
+  },
+  "comic-meteor.jp": {
+    "template": "speedbinb",
+    "url": "https://comic-meteor.jp",
+    "path": "/list/"
+  },
+  "comic-polaris.jp": {
+    "template": "speedbinb",
+    "url": "https://comic-polaris.jp",
+    "path": "/list/"
+  },
+  "comic-valkyrie.com": {
+    "template": "speedbinb",
+    "url": "https://www.comic-valkyrie.com",
+    "path": "/list/"
+  },
+  "digitalmargaret.jp": {
+    "template": "speedbinb",
+    "url": "https://digitalmargaret.jp",
+    "path": "/list/"
+  },
+  "gaugau.futabanet.jp": {
+    "template": "speedbinb",
+    "url": "https://gaugau.futabanet.jp",
+    "path": "/list/"
+  },
+  "read.futekiya.com": {
+    "template": "speedbinb",
+    "url": "https://read.futekiya.com",
+    "path": "/list/",
+    "headers": {
+      "x-cookie": "faconf="
+    }
+  },
+  "mangaplanet.com": {
+    "template": "speedbinb",
+    "url": "https://mangaplanet.com",
+    "path": "/list/",
+    "headers": {
+      "x-cookie": "mpaconf="
+    }
+  },
+  "mangaplaza.com": {
+    "template": "speedbinb",
+    "url": "https://mangaplaza.com",
+    "path": "/list/",
+    "headers": {
+      "x-cookie": "mp_over18_agreement=ON"
+    }
+  },
+  "webcomic.ohtabooks.com": {
+    "template": "speedbinb",
+    "url": "http://webcomic.ohtabooks.com",
+    "path": "/list/"
+  },
+  "123hon.com": {
+    "template": "speedbinb",
+    "url": "https://www.123hon.com",
+    "path": "/list/",
+    "selectors": {
+      "queryMangas": "ul.comic__list > li > a",
+      "queryChapters": "div.read-episode li"
+    }
+  }
+}

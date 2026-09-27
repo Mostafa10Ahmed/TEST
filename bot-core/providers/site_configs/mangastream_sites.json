@@ -1,0 +1,941 @@
+{
+  "acescans.xyz": {
+    "template": "mangastream",
+    "url": "https://acescans.xyz",
+    "path": "/manga/list-mode/"
+  },
+  "agscomics.com": {
+    "template": "mangastream",
+    "url": "https://agscomics.com",
+    "path": "/series/?list"
+  },
+  "ainzscans.net": {
+    "template": "mangastream",
+    "url": "https://ainzscans.net",
+    "path": "/series/list-mode"
+  },
+  "alpha-scans.org": {
+    "template": "mangastream",
+    "url": "https://alpha-scans.org",
+    "path": "/manga/list-mode/"
+  },
+  "alceascan.my.id": {
+    "template": "mangastream",
+    "url": "https://alceascan.my.id",
+    "path": "/manga/list-mode/"
+  },
+  "alkyonescans.com": {
+    "template": "mangastream",
+    "url": "https://alkyonescans.com",
+    "path": "/manga/list-mode/"
+  },
+  "anitationarts.org": {
+    "template": "mangastream",
+    "url": "https://anitationarts.org",
+    "path": "/manga/?list"
+  },
+  "anigliscans.xyz": {
+    "template": "mangastream",
+    "url": "https://anigliscans.xyz",
+    "path": "/series/?list"
+  },
+  "fl-ares.com": {
+    "template": "mangastream",
+    "url": "https://fl-ares.com",
+    "path": "/series/list-mode/"
+  },
+  "theapollo.team": {
+    "template": "mangastream",
+    "url": "https://theapollo.team",
+    "path": "/manga/list-mode/"
+  },
+  "ascalonscans.com": {
+    "template": "mangastream",
+    "url": "https://ascalonscans.com",
+    "path": "/manga/list-mode/"
+  },
+  "ayatoon.com": {
+    "template": "mangastream",
+    "url": "https://ayatoon.com",
+    "path": "/manga/list-mode"
+  },
+  "bacakomikid.com": {
+    "template": "mangastream",
+    "url": "https://bacakomikid.com",
+    "path": "/manga/?list"
+  },
+  "bacakomik.one": {
+    "template": "mangastream",
+    "url": "https://bacakomik.one",
+    "path": "/daftar-komik/?list",
+    "selectors": {
+      "queryMangas": "div.cpp div.daftarkartun div.jdlbar ul li a.tip",
+      "queryChapters": "div.eps_lst ul li span.lchx a",
+      "queryPages": "div#anjay_ini_id_kh img"
+    }
+  },
+  "azuremanga.com": {
+    "template": "mangastream",
+    "url": "https://azuremanga.com",
+    "path": "/manga/list-mode/"
+  },
+  "mangatale.id": {
+    "template": "mangastream",
+    "url": "https://mangatale.id",
+    "path": "/manga/list-mode/"
+  },
+  "banana-scan.com": {
+    "template": "mangastream",
+    "url": "https://banana-scan.com",
+    "path": "/manga/list-mode/"
+  },
+  "blackarmy.fr": {
+    "template": "mangastream",
+    "url": "https://blackarmy.fr",
+    "path": "/manga/list-mode/"
+  },
+  "boosei.net": {
+    "template": "mangastream",
+    "url": "https://boosei.net",
+    "path": "/manga/list-mode/",
+    "ts_reader": true
+  },
+  "chiotaku.com": {
+    "template": "mangastream",
+    "url": "https://chiotaku.com",
+    "path": "/manga/?list"
+  },
+  "constellarscans.com": {
+    "template": "mangastream",
+    "url": "https://constellarscans.com",
+    "path": "/manga/list-mode/",
+    "selectors": {
+      "queryPages": "div#reader_area img[src]:not([src="
+    },
+    "ts_reader": true
+  },
+  "cosmicscans.com": {
+    "template": "mangastream",
+    "url": "https://cosmicscans.com",
+    "path": "/manga/list-mode"
+  },
+  "cosmicscans.id": {
+    "template": "mangastream",
+    "url": "https://cosmicscans.id",
+    "path": "/manga/list-mode"
+  },
+  "culturedworks.com": {
+    "template": "mangastream",
+    "url": "https://culturedworks.com",
+    "path": "/manga/list-mode/"
+  },
+  "cypherscans.xyz": {
+    "template": "mangastream",
+    "url": "https://cypherscans.xyz",
+    "path": "/manga/list-mode/"
+  },
+  "doujin69.com": {
+    "template": "mangastream",
+    "url": "https://doujin69.com",
+    "path": "/doujin/list-mode/"
+  },
+  "diskusscan.com": {
+    "template": "mangastream",
+    "url": "https://diskusscan.com",
+    "path": "/manga/list-mode"
+  },
+  "doujindesu.tv": {
+    "template": "mangastream",
+    "url": "https://doujindesu.tv",
+    "path": "/manga/page/%PAGE%/",
+    "selectors": {
+      "queryMangas": "div.entries article.entry a",
+      "queryChapters": "div#chapter_list div.epsleft span.lchx a",
+      "queryPages": "div.main div img[src]:not([src=",
+      "querMangaTitleFromURI": "section.metadata h1.title"
+    },
+    "ts_reader": true
+  },
+  "doujinku.xyz": {
+    "template": "mangastream",
+    "url": "https://doujinku.xyz",
+    "path": "/manga/list-mode/"
+  },
+  "doujinland.online": {
+    "template": "mangastream",
+    "url": "https://doujinland.online",
+    "path": "/manga-list/?list",
+    "selectors": {
+      "queryMangas": "div.mangalist-blc ul li a",
+      "queryChapters": "div.series-chapter ul.series-chapterlist li div.flexch-infoz a",
+      "queryPages": "div.reader-area img[src]:not([src=",
+      "queryChaptersTitle": "span",
+      "querMangaTitleFromURI": "div.series-title h2",
+      "queryChaptersTitleBloat": "span > span.date"
+    }
+  },
+  "doujinmitai.com": {
+    "template": "mangastream",
+    "url": "https://doujinmitai.com",
+    "path": "/manga/list-mode/"
+  },
+  "drakecomic.org": {
+    "template": "mangastream",
+    "url": "https://drakecomic.org",
+    "path": "/manga/list-mode/"
+  },
+  "duniakomik.org": {
+    "template": "mangastream",
+    "url": "https://duniakomik.org",
+    "path": "/manga/list-mode/"
+  },
+  "mangas-scans.com": {
+    "template": "mangastream",
+    "url": "https://mangas-scans.com",
+    "path": "/manga/list-mode/"
+  },
+  "flamecomics.xyz": {
+    "template": "mangastream",
+    "url": "https://flamecomics.xyz",
+    "path": "/series/list-mode/",
+    "selectors": {
+      "queryMangas": "div.postbody div.soralist ul li a.series",
+      "queryChapters": "div#chapterlist ul li a"
+    }
+  },
+  "franxxmangas.net": {
+    "template": "mangastream",
+    "url": "https://franxxmangas.net",
+    "path": "/manga/list-mode/"
+  },
+  "freakscans.com": {
+    "template": "mangastream",
+    "url": "https://freakscans.com",
+    "path": "/manga/list-mode"
+  },
+  "gs-nation.fr": {
+    "template": "mangastream",
+    "url": "https://gs-nation.fr",
+    "path": "/manga/list-mode/"
+  },
+  "fusionscanlation.com": {
+    "template": "mangastream",
+    "url": "https://fusionscanlation.com",
+    "path": "/proyectos/page/",
+    "selectors": {
+      "queryMangas": "div.listupd div.bsx a"
+    }
+  },
+  "gabutscans.com": {
+    "template": "mangastream",
+    "url": "https://gabutscans.com",
+    "path": "/manga/list-mode/"
+  },
+  "futari.info": {
+    "template": "mangastream",
+    "url": "https://futari.info",
+    "path": "/manga/list-mode/"
+  },
+  "galaxyaction.site": {
+    "template": "mangastream",
+    "url": "https://galaxyaction.site",
+    "path": "/manga/list-mode/"
+  },
+  "geassscan.xyz": {
+    "template": "mangastream",
+    "url": "https://geassscan.xyz",
+    "path": "/manga/list-mode/"
+  },
+  "gremorymangas.com": {
+    "template": "mangastream",
+    "url": "https://gremorymangas.com",
+    "path": "/manga/list-mode/"
+  },
+  "gurukomik.com": {
+    "template": "mangastream",
+    "url": "https://gurukomik.com",
+    "path": "/manga/list-mode/"
+  },
+  "grazescans.com": {
+    "template": "mangastream",
+    "url": "https://grazescans.com",
+    "path": "/manga/list-mode/",
+    "selectors": {
+      "queryChapters": "div#chapterlist ul li a"
+    }
+  },
+  "hakaiscan.xyz": {
+    "template": "mangastream",
+    "url": "http://hakaiscan.xyz",
+    "path": "/manga/list-mode/"
+  },
+  "hinapyon.top": {
+    "template": "mangastream",
+    "url": "https://hinapyon.top",
+    "path": "/list-doujin/?list",
+    "selectors": {
+      "queryMangas": "div#container div.listpst ul li a",
+      "queryChapters": "div#chapter_list div.epsleft span.lchx a",
+      "queryPages": "div.reader-area img[src]:not([src=",
+      "querMangaTitleFromURI": "div#infoarea div.post-body h1.entry-title"
+    }
+  },
+  "hikariscan.com.br": {
+    "template": "mangastream",
+    "url": "https://hikariscan.com.br",
+    "path": "/manga/list-mode/"
+  },
+  "imperfectcomic.org": {
+    "template": "mangastream",
+    "url": "https://imperfectcomic.org",
+    "path": "/manga/list-mode/"
+  },
+  "kaiscans.org": {
+    "template": "mangastream",
+    "url": "https://kaiscans.org",
+    "path": "/manga/list-mode/"
+  },
+  "katakomik.my.id": {
+    "template": "mangastream",
+    "url": "https://katakomik.my.id",
+    "path": "/manga/list-mode/"
+  },
+  "kanzenin.info": {
+    "template": "mangastream",
+    "url": "https://kanzenin.info",
+    "path": "/manga/list-mode/"
+  },
+  "kaisarkomik.com": {
+    "template": "mangastream",
+    "url": "https://kaisarkomik.com",
+    "path": "/manga/?list"
+  },
+  "kombatch.cc": {
+    "template": "mangastream",
+    "url": "https://kombatch.cc",
+    "path": "/manga/list-mode/"
+  },
+  "klankomik.com": {
+    "template": "mangastream",
+    "url": "https://klankomik.com",
+    "path": "/manga/list-mode/"
+  },
+  "komikgo.co.id": {
+    "template": "mangastream",
+    "url": "https://www.komikgo.co.id",
+    "path": "/manga/?list",
+    "selectors": {
+      "queryChapters": "div.bixbox.bxcl ul li span.lchx a"
+    }
+  },
+  "kolnovel.com": {
+    "template": "mangastream",
+    "url": "https://kolnovel.com",
+    "path": "/series/list-mode/",
+    "selectors": {
+      "queryChapters": "div.eplister ul li a",
+      "queryChaptersTitle": "div:not(.epl-date)"
+    }
+  },
+  "komiklab.com": {
+    "template": "mangastream",
+    "url": "https://komiklab.com",
+    "path": "/manga/list-mode/"
+  },
+  "komikcast.cz": {
+    "template": "mangastream",
+    "url": "https://komikcast.cz",
+    "path": "/daftar-komik/?list",
+    "selectors": {
+      "queryMangas": "div.text-mode_list-items ul li a.series, div.text-mode_list-items ul li a.text-mode_list-item",
+      "queryChapters": "div.komik_info-chapters ul li.komik_info-chapters-item a.chapter-link-item",
+      "queryPages": "div.main-reading-area img",
+      "querMangaTitleFromURI": "h1.komik_info-content-body-title"
+    }
+  },
+  "kiryuu.org": {
+    "template": "mangastream",
+    "url": "https://kiryuu.org",
+    "path": "/manga/list-mode/"
+  },
+  "komiksin.id": {
+    "template": "mangastream",
+    "url": "https://komiksin.id",
+    "path": "/manga/list-mode/"
+  },
+  "apkomik.cc": {
+    "template": "mangastream",
+    "url": "https://apkomik.cc",
+    "path": "/manga/list-mode/"
+  },
+  "komikindo.id": {
+    "template": "mangastream",
+    "url": "https://komikindo.id",
+    "path": "/daftar-komik/?list",
+    "selectors": {
+      "queryMangas": ".daftarkartun #abtext .jdlbar ul li a",
+      "queryChapters": "div#chapter_list span.lchx a",
+      "queryPages": "div.chapter-area div.chapter-image img[src]:not([src=",
+      "querMangaTitleFromURI": "main div.post-body h1.entry-title"
+    }
+  },
+  "komiklab.net": {
+    "template": "mangastream",
+    "url": "https://komiklab.net",
+    "path": "/manga/list-mode/"
+  },
+  "komikplay.com": {
+    "template": "mangastream",
+    "url": "https://komikplay.com",
+    "path": "/daftar-komik/",
+    "selectors": {
+      "queryMangas": "div.mangalist-blc ul li.Manga a.series",
+      "queryChapters": "div.series-chapter ul.series-chapterlist li div.flexch-infoz a",
+      "queryPages": "div.reader-area img[src]:not([src=",
+      "queryChaptersTitle": "span",
+      "querMangaTitleFromURI": "div.series-title h2",
+      "queryChaptersTitleBloat": "span > span.date"
+    }
+  },
+  "komikmama.co": {
+    "template": "mangastream",
+    "url": "https://komikmama.co",
+    "path": "/manga/list-mode/",
+    "selectors": {
+      "queryChapters": "div.bxcl ul li div.eph-num a"
+    }
+  },
+  "komiktap.info": {
+    "template": "mangastream",
+    "url": "https://komiktap.info",
+    "path": "/manga/list-mode/"
+  },
+  "komikstation.com": {
+    "template": "mangastream",
+    "url": "https://www.komikstation.com",
+    "path": "/manga/?list",
+    "selectors": {
+      "queryMangas": "div#content div.soralist ul li a.series",
+      "queryChapters": "div.bxcl ul li span.lchx a"
+    }
+  },
+  "komiksave.me": {
+    "template": "mangastream",
+    "url": "https://komiksave.me",
+    "path": "/komik/list-mode/"
+  },
+  "komiknesia.xyz": {
+    "template": "mangastream",
+    "url": "https://komiknesia.xyz",
+    "path": "/manga/list-mode"
+  },
+  "komikindo.info": {
+    "template": "mangastream",
+    "url": "https://komikindo.info",
+    "path": "/manga-list/",
+    "selectors": {
+      "queryMangas": "div.mangalist-blc ul li.Manga a.series",
+      "queryChapters": "div.series-chapter ul.series-chapterlist li div.flexch-infoz a",
+      "queryPages": "div.reader-area img[src]:not([src=",
+      "querMangaTitleFromURI": "div.series-title h2",
+      "queryChaptersTitleBloat": "span.date"
+    }
+  },
+  "kraw.org": {
+    "template": "mangastream",
+    "url": "https://kraw.org",
+    "path": "/manga/list-mode/"
+  },
+  "komikru.com": {
+    "template": "mangastream",
+    "url": "https://komikru.com",
+    "path": "/manga/?list"
+  },
+  "komiku.com": {
+    "template": "mangastream",
+    "url": "https://komiku.com",
+    "path": "/manga/list-mode/"
+  },
+  "kumamanga.my.id": {
+    "template": "mangastream",
+    "url": "https://kumamanga.my.id",
+    "path": "/manga-list/?list",
+    "selectors": {
+      "queryMangas": "div.mangalist-blc ul li a",
+      "queryChapters": "div.series-chapter ul.series-chapterlist li div.flexch-infoz a",
+      "queryPages": "div.reader-area img[src]:not([src=",
+      "queryChaptersTitle": "span",
+      "querMangaTitleFromURI": "div.series-title h2",
+      "queryChaptersTitleBloat": "span > span.date"
+    }
+  },
+  "kumascans.com": {
+    "template": "mangastream",
+    "url": "https://kumascans.com",
+    "path": "/manga/list-mode/"
+  },
+  "lelmanga.com": {
+    "template": "mangastream",
+    "url": "https://www.lelmanga.com",
+    "path": "/manga/list-mode/"
+  },
+  "legacy-scans.com": {
+    "template": "mangastream",
+    "url": "https://legacy-scans.com",
+    "path": "/manga/list-mode/",
+    "selectors": {
+      "queryChapters": "div#chapterlist ul li a"
+    }
+  },
+  "lami-manga.com": {
+    "template": "mangastream",
+    "url": "https://lami-manga.com",
+    "path": "/manga/list-mode/"
+  },
+  "legionasia.com": {
+    "template": "mangastream",
+    "url": "https://legionasia.com",
+    "path": "/manga/list-mode/",
+    "ts_reader": true
+  },
+  "lshistoria.com": {
+    "template": "mangastream",
+    "url": "https://lshistoria.com",
+    "path": "/manga/list-mode/"
+  },
+  "lemonjuicescan.com": {
+    "template": "mangastream",
+    "url": "https://lemonjuicescan.com",
+    "path": "/manga/list-mode"
+  },
+  "lianscans.my.id": {
+    "template": "mangastream",
+    "url": "https://www.lianscans.my.id",
+    "path": "/manga/",
+    "selectors": {
+      "queryMangas": "div.listupd div.bs div.bsx > a",
+      "queryChapters": "div.eplister div.chbox div.eph-num a",
+      "queryPages": "div.readerarea img[src]:not([src=",
+      "queryChaptersTitle": "div.eplister div.chbox div.eph-num a span.chapternum",
+      "querMangaTitleFromURI": "div.infox h1.entry-title"
+    }
+  },
+  "lunarscan.org": {
+    "template": "mangastream",
+    "url": "https://lunarscan.org",
+    "path": "/series/list-mode/"
+  },
+  "maid.my.id": {
+    "template": "mangastream",
+    "url": "https://www.maid.my.id",
+    "path": "/manga-list/?list",
+    "selectors": {
+      "queryMangas": "div.mangalist-blc ul li.Manga a.series",
+      "queryChapters": "div.series-chapter ul.series-chapterlist li div.flexch-infoz a",
+      "queryPages": "div.reader-area img[src]:not([src=",
+      "querMangaTitleFromURI": "div.series-title h2",
+      "queryChaptersTitleBloat": "span.date"
+    }
+  },
+  "luminous-scans.com": {
+    "template": "mangastream",
+    "url": "https://luminous-scans.com",
+    "path": "/series/list-mode/",
+    "selectors": {
+      "queryChapters": "div#chapterlist ul li a"
+    }
+  },
+  "lynxscans.com": {
+    "template": "mangastream",
+    "url": "https://lynxscans.com",
+    "path": "/comics/list-mode/"
+  },
+  "readers-point.space": {
+    "template": "mangastream",
+    "url": "https://readers-point.space",
+    "path": "/series/list-mode/"
+  },
+  "manga347.com": {
+    "template": "mangastream",
+    "url": "https://manga347.com",
+    "path": "/filter",
+    "selectors": {
+      "queryMangas": "div.manga-detail h3.manga-name a",
+      "queryChapters": "div.chapters-list-ul li.item.reading-item.chapter-item  > a",
+      "queryPages": "div#chapter-container img[data-src]",
+      "queryChaptersTitle": "span.name",
+      "querMangaTitleFromURI": "div.anisc-detail h1.manga-name"
+    }
+  },
+  "sensibleiowans.org": {
+    "template": "mangastream",
+    "url": "https://sensibleiowans.org",
+    "path": "/manga/list-mode/"
+  },
+  "mangacanblog.com": {
+    "template": "mangastream",
+    "url": "https://mangacanblog.com",
+    "path": "/daftar-komik-manga-bahasa-indonesia.html",
+    "selectors": {
+      "queryMangas": "div.blix ul li a.series"
+    }
+  },
+  "mangadisk.web.id": {
+    "template": "mangastream",
+    "url": "https://mangadisk.web.id",
+    "path": "/manga/list-mode/",
+    "selectors": {
+      "queryPages": "div#readerarea canvas"
+    }
+  },
+  "manhuascan.us": {
+    "template": "mangastream",
+    "url": "https://manhuascan.us",
+    "path": "/manga-list?page=",
+    "selectors": {
+      "queryMangas": "div.listupd div.bsx > a"
+    }
+  },
+  "mangagenki.com": {
+    "template": "mangastream",
+    "url": "https://mangagenki.com",
+    "path": "/manga/?list"
+  },
+  "mangakid.site": {
+    "template": "mangastream",
+    "url": "https://mangakid.site",
+    "path": "/manga-lists/",
+    "selectors": {
+      "queryChapters": "div.cl ul li span.leftoff a"
+    }
+  },
+  "mangakane.com": {
+    "template": "mangastream",
+    "url": "https://mangakane.com",
+    "path": "/daftar-komik/",
+    "selectors": {
+      "queryMangas": "div.mangalist-blc ul li.Manga a.series",
+      "queryChapters": "div.series-chapter ul.series-chapterlist li div.flexch-infoz a",
+      "queryPages": "div.reader-area img[src]:not([src=",
+      "queryChaptersTitle": "span",
+      "querMangaTitleFromURI": "div.series-title h2",
+      "queryChaptersTitleBloat": "span > span.date"
+    }
+  },
+  "mangakita.id": {
+    "template": "mangastream",
+    "url": "https://mangakita.id",
+    "path": "/manga/list-mode/"
+  },
+  "mangaokutr.com": {
+    "template": "mangastream",
+    "url": "https://mangaokutr.com",
+    "path": "/manga/list-mode/"
+  },
+  "mangaproz.xyz": {
+    "template": "mangastream",
+    "url": "https://mangaproz.xyz",
+    "path": "/series/list-mode/"
+  },
+  "mangasusuku.xyz": {
+    "template": "mangastream",
+    "url": "https://mangasusuku.xyz",
+    "path": "/komik/list-mode/"
+  },
+  "mangashiro.me": {
+    "template": "mangastream",
+    "url": "https://mangashiro.me",
+    "path": "/manga/?list",
+    "selectors": {
+      "queryPages": "div#readerarea > :not(.kln) img[src]:not([src="
+    }
+  },
+  "swatscans.com": {
+    "template": "mangastream",
+    "url": "https://swatscans.com",
+    "path": "/manga/list-mode",
+    "selectors": {
+      "queryMangas": "div.soralist ul li a.series",
+      "queryChapters": "div.bxcl ul li span.lchx a"
+    },
+    "ts_reader": true
+  },
+  "mangasusu.biz": {
+    "template": "mangastream",
+    "url": "https://mangasusu.biz",
+    "path": "/manga/list-mode/"
+  },
+  "mangacim.com": {
+    "template": "mangastream",
+    "url": "https://www.mangacim.com",
+    "path": "/manga/list-mode/"
+  },
+  "mangakyo.org": {
+    "template": "mangastream",
+    "url": "https://mangakyo.org",
+    "path": "/komik/list-mode/",
+    "selectors": {
+      "queryChapters": "div.bxcl ul li div.eph-num a"
+    }
+  },
+  "mangaindo.me": {
+    "template": "mangastream",
+    "url": "https://mangaindo.me",
+    "path": "/manga/list-mode/"
+  },
+  "mangaschan.net": {
+    "template": "mangastream",
+    "url": "https://mangaschan.net",
+    "path": "/manga/list-mode/"
+  },
+  "mangas-raw.com": {
+    "template": "mangastream",
+    "url": "https://mangas-raw.com",
+    "path": "/manga/list-mode/"
+  },
+  "mangajp.top": {
+    "template": "mangastream",
+    "url": "https://mangajp.top",
+    "path": "/manga/list-mode/"
+  },
+  "mangkomik.net": {
+    "template": "mangastream",
+    "url": "https://mangkomik.net",
+    "path": "/manga/list-mode/"
+  },
+  "manhwa-freak.org": {
+    "template": "mangastream",
+    "url": "https://manhwa-freak.org",
+    "path": "/manga/",
+    "selectors": {
+      "queryMangas": "div.lastest-serie > a",
+      "queryChapters": "div.chapter-li > a",
+      "queryChaptersTitle": "div.chapter-info > p"
+    }
+  },
+  "manhwatime.xyz": {
+    "template": "mangastream",
+    "url": "https://manhwatime.xyz",
+    "path": "/manhwa/?list",
+    "selectors": {
+      "queryMangas": "div.animepost div.animposx > a",
+      "queryChapters": "div#chapter_list span.lchx a",
+      "queryPages": "div.reader-area img[src]:not([src="
+    }
+  },
+  "manhwaindo.com": {
+    "template": "mangastream",
+    "url": "https://manhwaindo.com",
+    "path": "/series/list-mode/"
+  },
+  "manhwaland.ink": {
+    "template": "mangastream",
+    "url": "https://www.manhwaland.ink",
+    "path": "/manga/list-mode/"
+  },
+  "manhwalist.com": {
+    "template": "mangastream",
+    "url": "https://manhwalist.com",
+    "path": "/manga/?list"
+  },
+  "manhwataro.xyz": {
+    "template": "mangastream",
+    "url": "https://manhwataro.xyz",
+    "path": "/komik/list-mode/"
+  },
+  "manhwax.org": {
+    "template": "mangastream",
+    "url": "https://manhwax.org",
+    "path": "/manga/list-mode/"
+  },
+  "martialmanga.com": {
+    "template": "mangastream",
+    "url": "https://martialmanga.com",
+    "path": "/manga/list-mode/"
+  },
+  "masterkomik.com": {
+    "template": "mangastream",
+    "url": "https://masterkomik.com",
+    "path": "/manga/list-mode/"
+  },
+  "miscans.my.id": {
+    "template": "mangastream",
+    "url": "https://miscans.my.id",
+    "path": "/manga/list-mode/"
+  },
+  "zonamiau.com": {
+    "template": "mangastream",
+    "url": "https://zonamiau.com",
+    "path": "/manga/list-mode/"
+  },
+  "matakomik.com": {
+    "template": "mangastream",
+    "url": "https://matakomik.com",
+    "path": "/manga/?list",
+    "selectors": {
+      "queryChapters": "div.bxcl ul li span.lchx a"
+    }
+  },
+  "monzeekomik.my.id": {
+    "template": "mangastream",
+    "url": "https://monzeekomik.my.id",
+    "path": "/manga/list-mode/"
+  },
+  "mundomangakun.com.br": {
+    "template": "mangastream",
+    "url": "https://mundomangakun.com.br",
+    "path": "/manga/list-mode/"
+  },
+  "natsu.id": {
+    "template": "mangastream",
+    "url": "https://natsu.id",
+    "path": "/manga/list-mode/"
+  },
+  "nekomik.me": {
+    "template": "mangastream",
+    "url": "https://nekomik.me",
+    "path": "/manga/list-mode/"
+  },
+  "ngomik.mom": {
+    "template": "mangastream",
+    "url": "https://ngomik.mom",
+    "path": "/manga/list-mode/"
+  },
+  "nightsup.net": {
+    "template": "mangastream",
+    "url": "https://nightsup.net",
+    "path": "/manga/list-mode/"
+  },
+  "nirvanamanga.com": {
+    "template": "mangastream",
+    "url": "https://nirvanamanga.com",
+    "path": "/manga/list-mode/"
+  },
+  "comic21.me": {
+    "template": "mangastream",
+    "url": "https://comic21.me",
+    "path": "/manga/list-mode/"
+  },
+  "noromax.my.id": {
+    "template": "mangastream",
+    "url": "https://noromax.my.id",
+    "path": "/Komik/list-mode/"
+  },
+  "noxsubs.com": {
+    "template": "mangastream",
+    "url": "https://noxsubs.com",
+    "path": "/manga/list-mode/"
+  },
+  "nyraxmanga.com": {
+    "template": "mangastream",
+    "url": "https://nyraxmanga.com",
+    "path": "/manga/list-mode/"
+  },
+  "oniscans.com": {
+    "template": "mangastream",
+    "url": "https://www.oniscans.com",
+    "path": "/manga/list-mode/"
+  },
+  "ozulscans.net": {
+    "template": "mangastream",
+    "url": "https://ozulscans.net",
+    "path": "/manga/list-mode/"
+  },
+  "oxapk.com": {
+    "template": "mangastream",
+    "url": "https://oxapk.com",
+    "path": "/manga/list-mode/"
+  },
+  "patatescans.com": {
+    "template": "mangastream",
+    "url": "https://patatescans.com",
+    "path": "/manga/list-mode/"
+  },
+  "ozulscansen.com": {
+    "template": "mangastream",
+    "url": "https://ozulscansen.com",
+    "path": "/comics/list-mode/"
+  },
+  "rackusreads.com": {
+    "template": "mangastream",
+    "url": "https://rackusreads.com",
+    "path": "/manga/list-mode/"
+  },
+  "otsugami.id": {
+    "template": "mangastream",
+    "url": "https://otsugami.id",
+    "path": "/manga/list-mode/"
+  },
+  "phenixscans.fr": {
+    "template": "mangastream",
+    "url": "https://phenixscans.fr",
+    "path": "/manga/list-mode"
+  },
+  "phoenixfansub.com": {
+    "template": "mangastream",
+    "url": "https://phoenixfansub.com",
+    "path": "/manga/list-mode/"
+  },
+  "pijamalikoi.com": {
+    "template": "mangastream",
+    "url": "https://pijamalikoi.com",
+    "path": "/m/manga/list-mode/"
+  },
+  "piscans.in": {
+    "template": "mangastream",
+    "url": "https://piscans.in",
+    "path": "/manga/list-mode/"
+  },
+  "seitacelestial.com": {
+    "template": "mangastream",
+    "url": "https://seitacelestial.com",
+    "path": "/comics/list-mode/"
+  },
+  "radiantscans.com": {
+    "template": "mangastream",
+    "url": "https://radiantscans.com",
+    "path": "/series/list-mode/",
+    "selectors": {
+      "queryChapters": "div#chapterlist ul li a"
+    }
+  },
+  "raikiscan.com": {
+    "template": "mangastream",
+    "url": "https://raikiscan.com",
+    "path": "/manga/list-mode/"
+  },
+  "readkomik.com": {
+    "template": "mangastream",
+    "url": "https://www.readkomik.com",
+    "path": "/manga/list-mode/"
+  },
+  "rawkuma.net": {
+    "template": "mangastream",
+    "url": "https://rawkuma.net",
+    "path": "/manga/list-mode/"
+  },
+  "readmng.com": {
+    "template": "mangastream",
+    "url": "https://www.readmng.com",
+    "path": "/list/",
+    "selectors": {
+      "queryMangas": ".mangaSliderCard a",
+      "querMangaTitleFromURI": "div.titleArea > h2"
+    }
+  },
+  "rizzfables.com": {
+    "template": "mangastream",
+    "url": "https://rizzfables.com",
+    "path": "/series/"
+  },
+  "ar.realmscans.com": {
+    "template": "mangastream",
+    "url": "https://ar.realmscans.com",
+    "path": "/series/?list"
+  },
+  "reaperscans.com.tr": {
+    "template": "mangastream",
+    "url": "https://reaperscans.com.tr",
+    "path": "/manga/list-mode/"
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "edelgardescans.com": {
+    "template": "genkan",
+    "url": "https://edelgardescans.com",
+    "path": "/list/"
+  },
+  "hatigarmscanz.net": {
+    "template": "genkan",
+    "url": "https://hatigarmscanz.net",
+    "path": "/list/"
+  },
+  "hunlight-scans.info": {
+    "template": "genkan",
+    "url": "https://hunlight-scans.info",
+    "path": "/list/"
+  },
+  "kkjscans.co": {
+    "template": "genkan",
+    "url": "https://kkjscans.co",
+    "path": "/list/"
+  },
+  "kaguyadex.com": {
+    "template": "genkan",
+    "url": "https://kaguyadex.com",
+    "path": "/list/"
+  },
+  "komiscans.com": {
+    "template": "genkan",
+    "url": "https://komiscans.com",
+    "path": "/list/"
+  },
+  "krakenscans.com": {
+    "template": "genkan",
+    "url": "https://krakenscans.com",
+    "path": "/list/"
+  },
+  "methodscans.com": {
+    "template": "genkan",
+    "url": "https://methodscans.com",
+    "path": "/list/"
+  },
+  "oneshotscans.com": {
+    "template": "genkan",
+    "url": "https://oneshotscans.com",
+    "path": "/list/"
+  },
+  "psychoplay.co": {
+    "template": "genkan",
+    "url": "https://psychoplay.co",
+    "path": "/list/"
+  }
+}

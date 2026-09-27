@@ -1,0 +1,98 @@
+{
+  "dmzj.com": {
+    "template": "sinmh",
+    "url": "https://www.dmzj.com",
+    "path": "/category/0-0-0-0-0-0-%PAGE%.html",
+    "selectors": {
+      "queryMangas": "h3 > a",
+      "queryChapters": "div.tab-content-selected ul li a"
+    }
+  },
+  "gufengmh8.com": {
+    "template": "sinmh",
+    "url": "https://www.gufengmh8.com",
+    "path": "/list/"
+  },
+  "guoman8.cc": {
+    "template": "sinmh",
+    "url": "http://www.guoman8.cc",
+    "path": "/list/p-%PAGE%",
+    "selectors": {
+      "queryChapters": "div.chapter-list ul li a"
+    }
+  },
+  "icekr.com": {
+    "template": "sinmh",
+    "url": "https://www.icekr.com",
+    "path": "/list/"
+  },
+  "imitui.com": {
+    "template": "sinmh",
+    "url": "https://www.imitui.com",
+    "path": "/list/"
+  },
+  "kokomh.com": {
+    "template": "sinmh",
+    "url": "https://www.kokomh.com",
+    "path": "/all/%PAGE%.html",
+    "selectors": {
+      "queryMangas": "div.mh-works-title h4 a"
+    }
+  },
+  "manhuaniu.com": {
+    "template": "sinmh",
+    "url": "https://www.manhuaniu.com",
+    "path": "/list/",
+    "selectors": {
+      "queryChapters": "div.comic-chapters ul li a:not([href*="
+    }
+  },
+  "36mh.net": {
+    "template": "sinmh",
+    "url": "https://www.36mh.net",
+    "path": "/list/"
+  },
+  "manhuagui.com": {
+    "template": "sinmh",
+    "url": "https://www.manhuagui.com",
+    "path": "/list/index_p%PAGE%.html",
+    "selectors": {
+      "queryChapters": "div.chapter-list ul li a"
+    }
+  },
+  "manhuafen.com": {
+    "template": "sinmh",
+    "url": "https://www.manhuafen.com",
+    "path": "/list/",
+    "selectors": {
+      "queryMangas": "ul.list_con_li li span.comic_list_det h3 a",
+      "queryChapters": "div.zj_list_con ul li a"
+    }
+  },
+  "manhuabei.com": {
+    "template": "sinmh",
+    "url": "https://www.manhuabei.com",
+    "path": "/list/",
+    "selectors": {
+      "queryMangas": "ul.list_con_li li span.comic_list_det h3 a",
+      "queryChapters": "div.zj_list_con ul li a"
+    }
+  },
+  "manmankan.cc": {
+    "template": "sinmh",
+    "url": "https://manmankan.cc",
+    "path": "/sort/%PAGE%.html",
+    "selectors": {
+      "queryMangas": "div.cy_list_mh ul li.title a"
+    }
+  },
+  "qiman6.com": {
+    "template": "sinmh",
+    "url": "http://www.qiman6.com",
+    "path": "/rank/1-%PAGE%.html",
+    "selectors": {
+      "queryMangas": "div.mainForm div.updateList div.bookList_3 div.ib p.title a",
+      "queryChapters": "div.chapterList div#chapter-list1 a.ib"
+    }
+  }
+}

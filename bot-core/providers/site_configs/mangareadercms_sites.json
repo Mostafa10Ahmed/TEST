@@ -1,0 +1,203 @@
+{
+  "amascan.com": {
+    "template": "mangareadercms",
+    "url": "https://amascan.com",
+    "path": "/list/"
+  },
+  "animaregia.net": {
+    "template": "mangareadercms",
+    "url": "https://animaregia.net",
+    "path": "/list/"
+  },
+  "anzmangashd.com": {
+    "template": "mangareadercms",
+    "url": "https://www.anzmangashd.com",
+    "path": "/list/"
+  },
+  "biamam.com": {
+    "template": "mangareadercms",
+    "url": "http://biamam.com",
+    "path": "/list/"
+  },
+  "frscans.com": {
+    "template": "mangareadercms",
+    "url": "https://www.frscans.com",
+    "path": "/list/"
+  },
+  "manga.fascans.com": {
+    "template": "mangareadercms",
+    "url": "https://manga.fascans.com",
+    "path": "/list/"
+  },
+  "oku.hidokuceviri.com": {
+    "template": "mangareadercms",
+    "url": "http://oku.hidokuceviri.com",
+    "path": "/list/"
+  },
+  "j-comics.ru": {
+    "template": "mangareadercms",
+    "url": "https://j-comics.ru",
+    "path": "/list/"
+  },
+  "jpmangas.xyz": {
+    "template": "mangareadercms",
+    "url": "https://jpmangas.xyz",
+    "path": "/list/"
+  },
+  "kangaryu-team.fr": {
+    "template": "mangareadercms",
+    "url": "https://kangaryu-team.fr",
+    "path": "/list/"
+  },
+  "kirishimafansub.net": {
+    "template": "mangareadercms",
+    "url": "https://www.kirishimafansub.net",
+    "path": "/reader/"
+  },
+  "komikgue.com": {
+    "template": "mangareadercms",
+    "url": "https://www.komikgue.com",
+    "path": "/list/",
+    "selectors": {
+      "queryChapters": "div.chapter-wrapper table td.chapter a"
+    }
+  },
+  "komikmanga.com": {
+    "template": "mangareadercms",
+    "url": "https://komikmanga.com",
+    "path": "/list/"
+  },
+  "komikid.com": {
+    "template": "mangareadercms",
+    "url": "https://www.komikid.com",
+    "path": "/list/"
+  },
+  "mangadenizi.net": {
+    "template": "mangareadercms",
+    "url": "http://www.mangadenizi.net",
+    "path": "/list/"
+  },
+  "mangadoor.com": {
+    "template": "mangareadercms",
+    "url": "http://mangadoor.com",
+    "path": "/list/"
+  },
+  "manga18.club": {
+    "template": "mangareadercms",
+    "url": "https://manga18.club",
+    "path": "/list/",
+    "selectors": {
+      "queryChapters": "ul li div.item a.chapter_num",
+      "queryPages": "div.imageChap source.img-responsive",
+      "queryTitleForURI": ".detail_name h1"
+    }
+  },
+  "mangahanta.com": {
+    "template": "mangareadercms",
+    "url": "http://www.mangahanta.com",
+    "path": "/list/"
+  },
+  "mangaid.click": {
+    "template": "mangareadercms",
+    "url": "https://www.mangaid.click",
+    "path": "/list/"
+  },
+  "mangakawaii.io": {
+    "template": "mangareadercms",
+    "url": "https://www.mangakawaii.io",
+    "path": "/list/",
+    "selectors": {
+      "queryMangas": "ul.manga-list-text li a.alpha-link",
+      "queryChapters": "table.table--manga tbody td.table__chapter a",
+      "queryTitleForURI": "h1[itemprop*="
+    }
+  },
+  "m.mangasusu.co": {
+    "template": "mangareadercms",
+    "url": "https://m.mangasusu.co",
+    "path": "/list/"
+  },
+  "manga-v2.mangavadisi.org": {
+    "template": "mangareadercms",
+    "url": "http://manga-v2.mangavadisi.org",
+    "path": "/list/"
+  },
+  "raws.mangazuki.co": {
+    "template": "mangareadercms",
+    "url": "https://raws.mangazuki.co",
+    "path": "/list/",
+    "selectors": {
+      "queryMangas": "ul.price-list li a",
+      "queryChapters": "ul.chapters li h3.chapter-title-rtl a"
+    }
+  },
+  "mangazuki.co": {
+    "template": "mangareadercms",
+    "url": "https://mangazuki.co",
+    "path": "/list/",
+    "selectors": {
+      "queryMangas": "ul.price-list li a",
+      "queryChapters": "ul.chapters li h3.chapter-title-rtl a"
+    }
+  },
+  "mangaraw.online": {
+    "template": "mangareadercms",
+    "url": "http://mangaraw.online",
+    "path": "/list/"
+  },
+  "ninemanga.net": {
+    "template": "mangareadercms",
+    "url": "https://ninemanga.net",
+    "path": "/list/"
+  },
+  "onma.top": {
+    "template": "mangareadercms",
+    "url": "https://onma.top",
+    "path": "/list/",
+    "selectors": {
+      "queryTitleForURI": ".panel .panel-heading"
+    }
+  },
+  "phoenix-scans.pl": {
+    "template": "mangareadercms",
+    "url": "http://phoenix-scans.pl",
+    "path": "/list/"
+  },
+  "puzzmos.com": {
+    "template": "mangareadercms",
+    "url": "https://puzzmos.com",
+    "path": "/list/"
+  },
+  "rawmanga.site": {
+    "template": "mangareadercms",
+    "url": "https://rawmanga.site",
+    "path": "/list/"
+  },
+  "rawmangaupdate.com": {
+    "template": "mangareadercms",
+    "url": "http://rawmangaupdate.com",
+    "path": "/list/",
+    "selectors": {
+      "queryChapters": "ul.chapters li h5.chapter-title-rtl a"
+    }
+  },
+  "readcomicsonline.ru": {
+    "template": "mangareadercms",
+    "url": "https://readcomicsonline.ru",
+    "path": "/list/"
+  },
+  "raindropteamfan.com": {
+    "template": "mangareadercms",
+    "url": "https://raindropteamfan.com",
+    "path": "/list/",
+    "selectors": {
+      "queryMangas": "ul.price-list li a",
+      "queryChapters": "ul.chapters li h3.chapter-title-rtl a"
+    }
+  },
+  "remangas.top": {
+    "template": "mangareadercms",
+    "url": "https://remangas.top",
+    "path": "/list/"
+  }
+}

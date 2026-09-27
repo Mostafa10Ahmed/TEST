@@ -1,0 +1,12 @@
+{
+  "mangabats.com": {
+    "template": "manganel",
+    "url": "https://www.mangabats.com",
+    "path": "/list/"
+  },
+  "mangakakalot.gg": {
+    "template": "manganel",
+    "url": "https://www.mangakakalot.gg",
+    "path": "/list/"
+  }
+}

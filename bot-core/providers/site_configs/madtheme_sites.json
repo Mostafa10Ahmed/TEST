@@ -1,0 +1,27 @@
+{
+  "manga1001.club": {
+    "template": "madtheme",
+    "url": "https://manga1001.club",
+    "path": "/popular"
+  },
+  "manga1001.top": {
+    "template": "madtheme",
+    "url": "https://manga1001.top",
+    "path": "/list/"
+  },
+  "mangabuddy.com": {
+    "template": "madtheme",
+    "url": "https://mangabuddy.com",
+    "path": "/list/"
+  },
+  "mangaforest.me": {
+    "template": "madtheme",
+    "url": "https://mangaforest.me",
+    "path": "/list/"
+  },
+  "kaliscan.io": {
+    "template": "madtheme",
+    "url": "https://kaliscan.io",
+    "path": "/list/"
+  }
+}

@@ -1,0 +1,189 @@
+{
+  "akaiyuhimun.ru": {
+    "template": "foolslide",
+    "url": "https://akaiyuhimun.ru",
+    "path": "/manga/directory/"
+  },
+  "motokare.xyz": {
+    "template": "foolslide",
+    "url": "http://motokare.xyz",
+    "path": "/reader/directory/"
+  },
+  "antisensescans.com": {
+    "template": "foolslide",
+    "url": "http://antisensescans.com",
+    "path": "/online/directory/"
+  },
+  "lector.dangolinenofansub.com": {
+    "template": "foolslide",
+    "url": "http://lector.dangolinenofansub.com",
+    "path": "/directory/"
+  },
+  "reader.deathtollscans.net": {
+    "template": "foolslide",
+    "url": "https://reader.deathtollscans.net",
+    "path": "/directory/"
+  },
+  "kobato.hologfx.com": {
+    "template": "foolslide",
+    "url": "https://kobato.hologfx.com",
+    "path": "/reader/directory/"
+  },
+  "reader.evilflowers.com": {
+    "template": "foolslide",
+    "url": "http://reader.evilflowers.com",
+    "path": "/directory/"
+  },
+  "reader.fos-scans.com": {
+    "template": "foolslide",
+    "url": "http://reader.fos-scans.com",
+    "path": "/directory/"
+  },
+  "hastareader.com": {
+    "template": "foolslide",
+    "url": "https://hastareader.com",
+    "path": "/slide/directory/"
+  },
+  "ddt.hastareader.com": {
+    "template": "foolslide",
+    "url": "https://ddt.hastareader.com",
+    "path": "/slide/directory/",
+    "selectors": {
+      "queryChapters": "div.chapters div.list div.title a"
+    }
+  },
+  "helveticascans.com": {
+    "template": "foolslide",
+    "url": "https://helveticascans.com",
+    "path": "/r/directory/"
+  },
+  "hni-scantrad.com": {
+    "template": "foolslide",
+    "url": "http://hni-scantrad.com",
+    "path": "/lel/directory/"
+  },
+  "manga.animefrontline.com": {
+    "template": "foolslide",
+    "url": "http://manga.animefrontline.com",
+    "path": "/directory/"
+  },
+  "hoshiscans.shounen-ai.net": {
+    "template": "foolslide",
+    "url": "http://hoshiscans.shounen-ai.net",
+    "path": "/directory/"
+  },
+  "reader.manga-download.org": {
+    "template": "foolslide",
+    "url": "http://reader.manga-download.org",
+    "path": "/directory/"
+  },
+  "maryfaye.net": {
+    "template": "foolslide",
+    "url": "http://www.maryfaye.net",
+    "path": "/reader/directory/"
+  },
+  "reader.jkrfb.xyz": {
+    "template": "foolslide",
+    "url": "https://reader.jkrfb.xyz",
+    "path": "/directory/"
+  },
+  "reader.kireicake.com": {
+    "template": "foolslide",
+    "url": "https://reader.kireicake.com",
+    "path": "/directory/"
+  },
+  "manga.smuglo.li": {
+    "template": "foolslide",
+    "url": "https://manga.smuglo.li",
+    "path": "/directory/"
+  },
+  "lolivault.net": {
+    "template": "foolslide",
+    "url": "https://lolivault.net",
+    "path": "/online/directory/"
+  },
+  "mabushimajo.com": {
+    "template": "foolslide",
+    "url": "http://mabushimajo.com",
+    "path": "/onlineokuma/directory/"
+  },
+  "onlinereader.mangascouts.org": {
+    "template": "foolslide",
+    "url": "http://onlinereader.mangascouts.org",
+    "path": "/directory/"
+  },
+  "mangasubes.patyscans.com": {
+    "template": "foolslide",
+    "url": "http://mangasubes.patyscans.com",
+    "path": "/directory/"
+  },
+  "mangaichiscans.mokkori.fr": {
+    "template": "foolslide",
+    "url": "http://mangaichiscans.mokkori.fr",
+    "path": "/fs/directory/"
+  },
+  "mangajinnofansub.com": {
+    "template": "foolslide",
+    "url": "https://www.mangajinnofansub.com",
+    "path": "/lector/directory/"
+  },
+  "mangatellers.gr": {
+    "template": "foolslide",
+    "url": "http://www.mangatellers.gr",
+    "path": "/reader/reader/list/"
+  },
+  "menudo-fansub.com": {
+    "template": "foolslide",
+    "url": "http://www.menudo-fansub.com",
+    "path": "/slide/directory/"
+  },
+  "npscan.mangaea.net": {
+    "template": "foolslide",
+    "url": "http://npscan.mangaea.net",
+    "path": "/slide/directory/",
+    "selectors": {
+      "queryMangas": "div.directory div.grid div.grid-item a",
+      "queryChapters": "div.list div.list-group div.list-group-item div.title a"
+    }
+  },
+  "noranofansub.com": {
+    "template": "foolslide",
+    "url": "https://www.noranofansub.com",
+    "path": "/lector/directory/"
+  },
+  "reader.otscans.com": {
+    "template": "foolslide",
+    "url": "https://reader.otscans.com",
+    "path": "/directory/"
+  },
+  "pcnet.patyscans.com": {
+    "template": "foolslide",
+    "url": "http://pcnet.patyscans.com",
+    "path": "/directory/"
+  },
+  "lector.patyscans.com": {
+    "template": "foolslide",
+    "url": "http://lector.patyscans.com",
+    "path": "/directory/"
+  },
+  "reader.serenade.moe": {
+    "template": "foolslide",
+    "url": "https://reader.serenade.moe",
+    "path": "/directory/"
+  },
+  "read.powermanga.org": {
+    "template": "foolslide",
+    "url": "http://read.powermanga.org",
+    "path": "/directory/"
+  },
+  "pzykosis666hfansub.com": {
+    "template": "foolslide",
+    "url": "https://pzykosis666hfansub.com",
+    "path": "/online/directory/"
+  },
+  "riceballicious.info": {
+    "template": "foolslide",
+    "url": "http://riceballicious.info",
+    "path": "/fs/reader/list/"
+  }
+}

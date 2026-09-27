@@ -1,0 +1,77 @@
+{
+  "batoscan.net": {
+    "template": "flatmanga",
+    "url": "https://batoscan.net",
+    "path": "/list/",
+    "selectors": {
+      "queryChapters": "div#tab-chapper div#list-chapters span.title a.chapter"
+    }
+  },
+  "epikmanga.com": {
+    "template": "flatmanga",
+    "url": "https://www.epikmanga.com",
+    "path": "/seri-listesi?ltype=text&type=text",
+    "selectors": {
+      "queryMangas": "div#pop-href div[id^=char-] a"
+    }
+  },
+  "heroscan.com": {
+    "template": "flatmanga",
+    "url": "https://heroscan.com",
+    "path": "/list/",
+    "selectors": {
+      "queryChapters": "div#tab-chapper span[class^="
+    }
+  },
+  "klz9.com": {
+    "template": "flatmanga",
+    "url": "https://klz9.com",
+    "path": "/list/"
+  },
+  "welovemanga.one": {
+    "template": "flatmanga",
+    "url": "https://welovemanga.one",
+    "path": "/manga-list.html",
+    "selectors": {
+      "queryMangas": "div.card-body div.series-title a",
+      "queryChapters": "ul.list-chapters > a"
+    }
+  },
+  "manga33.com": {
+    "template": "flatmanga",
+    "url": "https://www.manga33.com",
+    "path": "/list/lastdotime-0.html",
+    "selectors": {
+      "queryMangas": "div.media div.media-body h3.media-heading a",
+      "queryPages": "div.chapter-content source"
+    }
+  },
+  "manga-tr.com": {
+    "template": "flatmanga",
+    "url": "https://manga-tr.com",
+    "path": "/manga-list.html",
+    "selectors": {
+      "queryMangas": "div.container a[data-toggle="
+    },
+    "headers": {
+      "x-cookie": "read_type=1"
+    }
+  },
+  "manhuaz.net": {
+    "template": "flatmanga",
+    "url": "https://manhuaz.net",
+    "path": "/manhua-list.html?page=",
+    "selectors": {
+      "queryMangas": "div.series-title > a",
+      "queryChapters": "ul.list-chapters > a"
+    }
+  },
+  "manhwasmut.com": {
+    "template": "flatmanga",
+    "url": "https://manhwasmut.com",
+    "path": "/list/",
+    "selectors": {
+      "queryChapters": "div#tab-chapper div#list-chapters span.title a.chapter"
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "dongmanmanhua.cn": {
+    "template": "linewebtoon",
+    "url": "https://www.dongmanmanhua.cn",
+    "path": "/list/"
+  },
+  "webtoons.com/id": {
+    "template": "linewebtoon",
+    "url": "https://www.webtoons.com/id",
+    "path": "/list/"
+  },
+  "webtoons.com/es": {
+    "template": "linewebtoon",
+    "url": "https://www.webtoons.com/es",
+    "path": "/list/"
+  },
+  "webtoons.com/en": {
+    "template": "linewebtoon",
+    "url": "https://www.webtoons.com/en",
+    "path": "/list/"
+  },
+  "webtoons.com/fr": {
+    "template": "linewebtoon",
+    "url": "https://www.webtoons.com/fr",
+    "path": "/list/"
+  },
+  "translate.webtoons.com": {
+    "template": "linewebtoon",
+    "url": "https://translate.webtoons.com",
+    "path": "/list/"
+  },
+  "webtoons.com/zh": {
+    "template": "linewebtoon",
+    "url": "https://www.webtoons.com/zh",
+    "path": "/list/"
+  },
+  "webtoons.com/th": {
+    "template": "linewebtoon",
+    "url": "https://www.webtoons.com/th",
+    "path": "/list/"
+  },
+  "webtoons.com/de": {
+    "template": "linewebtoon",
+    "url": "https://www.webtoons.com/de",
+    "path": "/list/"
+  }
+}
