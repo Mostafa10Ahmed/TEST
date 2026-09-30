@@ -375,6 +375,7 @@ async def _send_to_inpainting_space(
     session: aiohttp.ClientSession,
     dilate_iter: int = 3,
     remove_sfx: bool = False,
+    lang: str = "ALL",
 ) -> tuple[bytes, int, int, float]:
     """
     Call the Inpainting Space /process_gradio_zip endpoint via gradio_client.
@@ -402,6 +403,7 @@ async def _send_to_inpainting_space(
                 key=Config.INPAINTING_SPACE_KEY,
                 dilate_iter=dilate_iter,
                 remove_sfx=remove_sfx,
+                lang=lang,
                 api_name="/process_gradio_zip"
             )
             return result
@@ -561,7 +563,8 @@ class ChapterSelectView(discord.ui.View):
         dilate_iter: int,
         remove_sfx: bool,
         parent_folder_id: str,
-        batch_title: str
+        batch_title: str,
+        lang: str = "ALL"
     ):
         super().__init__(timeout=60)
         self.interaction = interaction
@@ -572,6 +575,7 @@ class ChapterSelectView(discord.ui.View):
         self.remove_sfx = remove_sfx
         self.parent_folder_id = parent_folder_id
         self.batch_title = batch_title
+        self.lang = lang
         
         options = []
         for i, sf in enumerate(subfolders[:25]): # Discord select cap
@@ -604,7 +608,8 @@ class ChapterSelectView(discord.ui.View):
                     self.dilate_iter,
                     self.remove_sfx,
                     self.parent_folder_id,
-                    self.batch_title
+                    self.batch_title,
+                    lang=self.lang
                 )
             finally:
                 user_system.release_user_lock(self.interaction.user.id)
@@ -679,7 +684,8 @@ class MangaCleanerCog(commands.Cog):
         drive_url="رابط مجلد Google Drive المحتوي على صور الفصل",
         mode="وضع الجودة (HQ تبييض دقيق | FAST تبييض سريع)",
         dilate_iter="درجة توسيع الماسك (الافتراضي 3)",
-        sfx_mode="وضع المؤثرات الصوتية (NORMAL عادية | REMOVE_SFX_BETA إزالة المؤثرات للمشرفين)"
+        sfx_mode="وضع المؤثرات الصوتية (NORMAL عادية | REMOVE_SFX_BETA إزالة المؤثرات للمشرفين)",
+        lang="اللغة المطلوب تبييضها فقط (ALL الكل | EN إنجليزي فقط | KO كوري فقط)"
     )
     @user_only()
     async def clean_manga_cmd(
@@ -689,6 +695,7 @@ class MangaCleanerCog(commands.Cog):
         mode: str = "HQ",
         dilate_iter: int = 3,
         sfx_mode: str = "NORMAL",
+        lang: str = "ALL",
     ):
         user_id = interaction.user.id
         rank = await user_system.get_rank(user_id)
@@ -779,7 +786,8 @@ class MangaCleanerCog(commands.Cog):
                 dilate_iter,
                 remove_sfx,
                 parent_folder_id=folder_id,
-                batch_title=batch_title
+                batch_title=batch_title,
+                lang=lang
             )
             await interaction.edit_original_response(
                 content="📂 **عثرت على مجلدات فرعية في هذا الرابط!** يرجى تحديد الفصول التي تريد تبييضها وتنظيفها:",
@@ -800,7 +808,8 @@ class MangaCleanerCog(commands.Cog):
                         dilate_iter,
                         remove_sfx,
                         parent_folder_id=folder_id,
-                        batch_title=batch_title
+                        batch_title=batch_title,
+                        lang=lang
                     )
                 finally:
                     user_system.release_user_lock(user_id)
@@ -812,7 +821,8 @@ class MangaCleanerCog(commands.Cog):
         drive_url="رابط ملف ZIP على Google Drive (وليس مجلد) — مثال: https://drive.google.com/file/d/XXXX/view",
         mode="وضع الجودة (HQ تبييض دقيق | FAST تبييض سريع)",
         dilate_iter="درجة توسيع الماسك (الافتراضي 3)",
-        sfx_mode="وضع المؤثرات الصوتية (NORMAL عادية | REMOVE_SFX_BETA إزالة المؤثرات للمشرفين)"
+        sfx_mode="وضع المؤثرات الصوتية (NORMAL عادية | REMOVE_SFX_BETA إزالة المؤثرات للمشرفين)",
+        lang="اللغة المطلوب تبييضها فقط (ALL الكل | EN إنجليزي فقط | KO كوري فقط)"
     )
     @user_only()
     async def clean_zip_cmd(
@@ -822,6 +832,7 @@ class MangaCleanerCog(commands.Cog):
         mode: str = "HQ",
         dilate_iter: int = 3,
         sfx_mode: str = "NORMAL",
+        lang: str = "ALL",
     ):
         user_id = interaction.user.id
         rank = await user_system.get_rank(user_id)
@@ -926,7 +937,7 @@ class MangaCleanerCog(commands.Cog):
             try:
                 t_start = time.perf_counter()
                 pages, errors, drive_link, folder_id = await self.process_single_zip(
-                    interaction, dashboard, file_id, file_id, zip_title, mode, dilate_iter, remove_sfx, user_root
+                    interaction, dashboard, file_id, file_id, zip_title, mode, dilate_iter, remove_sfx, user_root, lang=lang
                 )
                 elapsed = time.perf_counter() - t_start
 
@@ -962,7 +973,8 @@ class MangaCleanerCog(commands.Cog):
         drive_urls="روابط ملفات ZIP على Google Drive، افصل بينها بسطر جديد أو مسافة (حتى 10 ملفات)",
         mode="وضع الجودة (HQ تبييض دقيق | FAST تبييض سريع)",
         dilate_iter="درجة توسيع الماسك (الافتراضي 3)",
-        sfx_mode="وضع المؤثرات الصوتية (NORMAL عادية | REMOVE_SFX_BETA إزالة المؤثرات للمشرفين)"
+        sfx_mode="وضع المؤثرات الصوتية (NORMAL عادية | REMOVE_SFX_BETA إزالة المؤثرات للمشرفين)",
+        lang="اللغة المطلوب تبييضها فقط (ALL الكل | EN إنجليزي فقط | KO كوري فقط)"
     )
     @user_only()
     async def clean_zip_multi_cmd(
@@ -972,6 +984,7 @@ class MangaCleanerCog(commands.Cog):
         mode: str = "HQ",
         dilate_iter: int = 3,
         sfx_mode: str = "NORMAL",
+        lang: str = "ALL",
     ):
         user_id = interaction.user.id
         rank = await user_system.get_rank(user_id)
@@ -1098,7 +1111,7 @@ class MangaCleanerCog(commands.Cog):
         async def _run_zip_batch():
             try:
                 await self.process_zip_queue(
-                    interaction, dashboard, items, mode, dilate_iter, remove_sfx, master_id, master_link, batch_title
+                    interaction, dashboard, items, mode, dilate_iter, remove_sfx, master_id, master_link, batch_title, lang=lang
                 )
             finally:
                 user_system.release_user_lock(user_id)
@@ -1114,7 +1127,8 @@ class MangaCleanerCog(commands.Cog):
         dilate_iter: int,
         remove_sfx: bool,
         parent_folder_id: str,
-        batch_title: str
+        batch_title: str,
+        lang: str = "ALL"
     ):
         user_id = interaction.user.id
         rank = await user_system.get_rank(user_id)
@@ -1178,7 +1192,7 @@ class MangaCleanerCog(commands.Cog):
                 break
 
             pages, errors, single_clean_link = await self.process_single(
-                interaction, dashboard, folder['id'], folder['name'], mode, dilate_iter, remove_sfx, master_id
+                interaction, dashboard, folder['id'], folder['name'], mode, dilate_iter, remove_sfx, master_id, lang=lang
             )
             total_pages_all += pages
             total_errors_all += errors
@@ -1227,7 +1241,8 @@ class MangaCleanerCog(commands.Cog):
         mode: str,
         dilate_iter: int,
         remove_sfx: bool,
-        master_folder_id: str
+        master_folder_id: str,
+        lang: str = "ALL"
     ) -> tuple[int, int, Optional[str]]:
         job_id      = uuid.uuid4().hex[:8]
         job_dir     = TEMP_ROOT / f"job_{job_id}"
@@ -1290,7 +1305,7 @@ class MangaCleanerCog(commands.Cog):
                 connector = aiohttp.TCPConnector(ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as session:
                     clean_zip_bytes, pages, errors, ai_elapsed = await _send_to_inpainting_space(
-                        zip_bytes, mode, session, dilate_iter, remove_sfx
+                        zip_bytes, mode, session, dilate_iter, remove_sfx, lang
                     )
 
                 if dashboard.is_cancelled: return pages, errors, None
@@ -1371,6 +1386,7 @@ class MangaCleanerCog(commands.Cog):
         dilate_iter: int,
         remove_sfx: bool,
         upload_parent_id: str,
+        lang: str = "ALL",
     ) -> tuple[int, int, Optional[str], Optional[str]]:
         """
         نفس منطق process_single تماماً، لكن المصدر هنا ملف ZIP مرفوع على Drive
@@ -1451,7 +1467,7 @@ class MangaCleanerCog(commands.Cog):
                 connector = aiohttp.TCPConnector(ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as session:
                     clean_zip_bytes, pages, errors, ai_elapsed = await _send_to_inpainting_space(
-                        zip_bytes, mode, session, dilate_iter, remove_sfx
+                        zip_bytes, mode, session, dilate_iter, remove_sfx, lang
                     )
 
                 if dashboard.is_cancelled: return pages, errors, None, None
@@ -1533,6 +1549,7 @@ class MangaCleanerCog(commands.Cog):
         master_id: str,
         master_link: str,
         batch_title: str,
+        lang: str = "ALL",
     ):
         """معالجة دفعة ملفات ZIP لأمر /clean_zip_multi — كلها تُرفَع داخل مجلد
         دفعة واحد (master_id) في مساحة تخزين المستخدم الخاصة، ويُجدوَل حذفه
@@ -1580,7 +1597,7 @@ class MangaCleanerCog(commands.Cog):
                 break
 
             pages, errors, item_link, _folder_id = await self.process_single_zip(
-                interaction, dashboard, item['id'], item['id'], item['name'], mode, dilate_iter, remove_sfx, master_id
+                interaction, dashboard, item['id'], item['id'], item['name'], mode, dilate_iter, remove_sfx, master_id, lang=lang
             )
             total_pages_all += pages
             total_errors_all += errors
