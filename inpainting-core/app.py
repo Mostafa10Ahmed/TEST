@@ -1120,7 +1120,95 @@ def _extract_precise_text_mask(image_bgr: np.ndarray, mask: np.ndarray, c_consta
     return out
 
 
-def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bool = False) -> tuple[np.ndarray, np.ndarray]:
+# ──────────────────────────────────────────────
+# Language Filter (اختيار اللغة المطلوب تبييضها فقط)
+# ──────────────────────────────────────────────
+# مستقل تماماً عن منطق الـSFX (remove_sfx) — هذا فلتر إضافي اختياري (lang="ALL"
+# افتراضياً = بدون أي تغيير في السلوك). عند اختيار "EN" أو "KO" يُستبعد فقط ما
+# تقرأه OCR بثقة معقولة كلغة مختلفة عن المطلوبة؛ أي نص لا تستطيع OCR قراءته
+# بثقة (خطوط الـSFX المُصمَّمة يدوياً غالباً) يبقى ضمن قناع الإزالة كالمعتاد،
+# حتى لا "يتلغبط" ويترك نصاً كان يجب مسحه بحجة عدم التأكد من لغته.
+lang_ocr_reader = None
+
+
+def ensure_lang_ocr_loaded():
+    """تحميل كسول لقارئ EasyOCR (كوري + إنجليزي) — لا يُحمَّل إلا عند استخدام
+    فلتر اللغة فعلياً، حتى لا يُثقل على الذاكرة لكل من لا يستخدم هذه الميزة."""
+    global lang_ocr_reader
+    if lang_ocr_reader is not None:
+        return
+    import easyocr
+    log.info("Loading EasyOCR reader (ko+en) for language-filtered cleaning...")
+    lang_ocr_reader = easyocr.Reader(["ko", "en"], gpu=torch.cuda.is_available())
+
+
+def _text_script(text: str) -> str:
+    """يحدد النص العائد من OCR: 'ko' (حروف هانغل كورية) أو 'en' (حروف لاتينية)
+    أو 'unknown' لو النص فارغ أو غير حاسم."""
+    if not text:
+        return "unknown"
+    hangul = sum(
+        1 for ch in text
+        if "\uac00" <= ch <= "\ud7a3" or "\u1100" <= ch <= "\u11ff" or "\u3130" <= ch <= "\u318f"
+    )
+    latin = sum(1 for ch in text if ch.isalpha() and ch.isascii())
+    if hangul == 0 and latin == 0:
+        return "unknown"
+    return "ko" if hangul >= latin else "en"
+
+
+def _apply_language_filter(image_bgr: np.ndarray, mask: np.ndarray, lang: str) -> np.ndarray:
+    """يستبعد من قناع التبييض أي قطعة نص تقرأها OCR بثقة ≥40% كلغة مختلفة عن
+    `lang` المطلوبة ('en' أو 'ko'). lang='ALL' أو أي قيمة أخرى = بدون فلترة
+    (سلوك افتراضي غير معطّل)."""
+    lang = (lang or "").strip().lower()
+    if lang not in {"en", "ko"} or mask is None or mask.max() == 0:
+        return mask
+
+    try:
+        ensure_lang_ocr_loaded()
+    except Exception as exc:
+        log.warning("Language filter unavailable (EasyOCR failed to load: %s) — skipping for this image.", exc)
+        return mask
+
+    h, w = mask.shape[:2]
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    keep = np.zeros((h, w), dtype=np.uint8)
+
+    for i in range(1, n):
+        x, y, bw, bh, area = stats[i]
+        if area < 1:
+            continue
+        pad = max(4, int(min(bw, bh) * 0.15))
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+        crop = image_bgr[y0:y1, x0:x1]
+        if crop.size == 0:
+            keep[labels == i] = 255
+            continue
+
+        try:
+            ocr_res = lang_ocr_reader.readtext(crop, detail=1)
+        except Exception:
+            keep[labels == i] = 255
+            continue
+
+        best_text, best_conf = "", 0.0
+        for _bbox, text, conf in ocr_res:
+            if conf > best_conf:
+                best_text, best_conf = text, conf
+
+        detected = _text_script(best_text) if best_conf >= 0.40 else "unknown"
+
+        if detected != "unknown" and detected != lang:
+            continue  # قراءة واثقة للغة مختلفة عن المطلوبة → استبعاد (حماية)
+
+        keep[labels == i] = 255
+
+    return keep
+
+
+def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bool = False, lang: str = "ALL") -> tuple[np.ndarray, np.ndarray]:
     """يبني قناع النص النهائي المطلوب تبييضه.
     يُرجع (final_mask, complex_guard_mask):
       final_mask         → القناع الكامل المُمرَّر إلى LaMa للتبييض.
@@ -1295,6 +1383,10 @@ def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bo
 
     # Re-apply scanlation watermark filter to ensure credit badge safety
     refined_mask = _filter_scanlation_watermarks(refined_mask, w, h)
+
+    # فلتر اللغة (اختياري): يستبعد أي قطعة تُقرأ بثقة كلغة غير المطلوبة
+    refined_mask = _apply_language_filter(image_bgr, refined_mask, lang)
+
     complex_guard_mask = cv2.bitwise_and(complex_guard_mask, refined_mask)
     return refined_mask, complex_guard_mask
 
@@ -1444,9 +1536,11 @@ def clean_single_image_helper(
     dilate_iter: int = DILATE_ITER,
     remove_sfx: bool = True,
     c_constant: int = C_CONSTANT,
+    lang: str = "ALL",
 ) -> bytes:
     """Processes and cleans a single manga/manhwa page image.
     Guarantees that character artwork, faces, eyes, ears, and background artwork are protected.
+    `lang`: 'ALL' (default, no filtering) | 'EN' | 'KO' — يبيّض فقط النص بهذه اللغة إن حُدِّدت.
     """
     try:
         ensure_models_loaded()
@@ -1458,7 +1552,9 @@ def clean_single_image_helper(
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         # Build comprehensive text mask (+ قناع المناطق الحساسة لحماية الرسم)
-        text_mask, complex_guard_mask = _build_text_mask(img_bgr, dilate_iter=dilate_iter, remove_sfx=remove_sfx)
+        text_mask, complex_guard_mask = _build_text_mask(
+            img_bgr, dilate_iter=dilate_iter, remove_sfx=remove_sfx, lang=lang
+        )
 
         if text_mask.max() > 0:
             img_clean = _hybrid_inpaint(img_rgb, text_mask)
@@ -1569,7 +1665,9 @@ def _merge_bubble_text(lines: list[dict], lang: str) -> str:
 
 
 @spaces.GPU(duration=120)
-def clean_images_batch(images_data: list[bytes], dilate_iter: int = 3, remove_sfx: bool = False) -> tuple[list[bytes], int]:
+def clean_images_batch(
+    images_data: list[bytes], dilate_iter: int = 3, remove_sfx: bool = False, lang: str = "ALL"
+) -> tuple[list[bytes], int]:
     ensure_models_loaded()
     
     results = []
@@ -1577,7 +1675,7 @@ def clean_images_batch(images_data: list[bytes], dilate_iter: int = 3, remove_sf
     
     for idx, raw in enumerate(images_data):
         try:
-            res = clean_single_image_helper(raw, dilate_iter=dilate_iter, remove_sfx=remove_sfx)
+            res = clean_single_image_helper(raw, dilate_iter=dilate_iter, remove_sfx=remove_sfx, lang=lang)
             results.append(res)
         except Exception as exc:
             log.warning("Batch process error on index %d: %s. Preserving raw image.", idx, exc)
@@ -1588,9 +1686,9 @@ def clean_images_batch(images_data: list[bytes], dilate_iter: int = 3, remove_sf
 
 
 @spaces.GPU
-def clean_single_image(image_bytes: bytes, dilate_iter: int = 3, remove_sfx: bool = False) -> bytes:
+def clean_single_image(image_bytes: bytes, dilate_iter: int = 3, remove_sfx: bool = False, lang: str = "ALL") -> bytes:
     ensure_models_loaded()
-    return clean_single_image_helper(image_bytes, dilate_iter=dilate_iter, remove_sfx=remove_sfx)
+    return clean_single_image_helper(image_bytes, dilate_iter=dilate_iter, remove_sfx=remove_sfx, lang=lang)
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1599,7 +1697,9 @@ def clean_single_image(image_bytes: bytes, dilate_iter: int = 3, remove_sfx: boo
 # ────────────────────────────────────────────────────────────────────────────
 
 @spaces.GPU(duration=120)
-def process_gradio_zip(file_obj, key: str, dilate_iter: int = 3, remove_sfx: bool = False) -> tuple[Optional[str], str]:
+def process_gradio_zip(
+    file_obj, key: str, dilate_iter: int = 3, remove_sfx: bool = False, lang: str = "ALL"
+) -> tuple[Optional[str], str]:
     if API_KEY and key:
         if not secrets.compare_digest(key, API_KEY):
             log.warning("Received non-matching API key. Proceeding with request.")
@@ -1625,8 +1725,10 @@ def process_gradio_zip(file_obj, key: str, dilate_iter: int = 3, remove_sfx: boo
             for name in image_entries:
                 raw_images.append(in_zip.read(name))
 
-        log.info("Processing Gradio batch of %d images with remove_sfx=%s...", len(raw_images), remove_sfx)
-        cleaned_images, errors = clean_images_batch(raw_images, dilate_iter=int(dilate_iter), remove_sfx=remove_sfx)
+        log.info("Processing Gradio batch of %d images with remove_sfx=%s, lang=%s...", len(raw_images), remove_sfx, lang)
+        cleaned_images, errors = clean_images_batch(
+            raw_images, dilate_iter=int(dilate_iter), remove_sfx=remove_sfx, lang=lang
+        )
 
         with zipfile.ZipFile(temp_out_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
             for idx, name in enumerate(image_entries):
@@ -1674,6 +1776,11 @@ with gr.Blocks(title="MangaSystem Manga Cleaner") as demo:
                 value=False,
                 label="إزالة المؤثرات الصوتية [BETA] (Remove SFX)",
             )
+            lang_dropdown = gr.Dropdown(
+                choices=["ALL", "EN", "KO"],
+                value="ALL",
+                label="اللغة المطلوب تبييضها فقط (Language Filter)",
+            )
             submit_btn = gr.Button("🚀 Run Inpainting & Clean Page", variant="primary")
 
         with gr.Column(scale=1):
@@ -1682,7 +1789,7 @@ with gr.Blocks(title="MangaSystem Manga Cleaner") as demo:
 
     submit_btn.click(
         fn=process_gradio_zip,
-        inputs=[file_input, key_input, dilate_slider, sfx_checkbox],
+        inputs=[file_input, key_input, dilate_slider, sfx_checkbox, lang_dropdown],
         outputs=[file_output, log_output],
     )
 
@@ -1737,6 +1844,7 @@ def patched_create_app(cls, blocks, *args, **kwargs):
         file: UploadFile = File(..., description="ZIP file containing manga images"),
         dilate_iter: int = 5,
         remove_sfx: bool = False,
+        lang: str = "ALL",
         _key: str = Depends(verify_key_dep),
     ):
         content = await file.read()
@@ -1756,8 +1864,13 @@ def patched_create_app(cls, blocks, *args, **kwargs):
         out_buf = io.BytesIO()
         raw_images = [in_zip.read(name) for name in image_entries]
 
-        log.info("Processing batch of %d images with dilate_iter: %d, remove_sfx: %s...", len(raw_images), dilate_iter, remove_sfx)
-        cleaned_images, errors_count = clean_images_batch(raw_images, dilate_iter=dilate_iter, remove_sfx=remove_sfx)
+        log.info(
+            "Processing batch of %d images with dilate_iter: %d, remove_sfx: %s, lang: %s...",
+            len(raw_images), dilate_iter, remove_sfx, lang
+        )
+        cleaned_images, errors_count = clean_images_batch(
+            raw_images, dilate_iter=dilate_iter, remove_sfx=remove_sfx, lang=lang
+        )
 
         with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
             for idx, name in enumerate(image_entries):
