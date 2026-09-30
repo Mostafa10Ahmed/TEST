@@ -1,674 +1,1927 @@
-import asyncio
-import json
+"""
+MangaCleaner GPU Microservice — app.py
+# v2-fixed: Hard mask blending (no ghost text), safe HF download, reduced pad
+Space: mmo9/Inpainting_bot
+GPU: RTX Pro 6000 Blackwell (48 GB VRAM) â€” Persistent Pro GPU / ZeroGPU
+
+Architecture:
+  Gradio application with custom FastAPI endpoints registered on the Gradio internal server.
+  This allows Hugging Face Gradio SDK to launch it natively as a Gradio app,
+  while still exposing the API endpoints for the Discord Bot.
+
+ZeroGPU Compatibility:
+  Uses the @spaces.GPU decorator for model inference to comply with Hugging Face ZeroGPU
+  startup requirements and dynamically allocate GPU resources.
+"""
+
+from __future__ import annotations
+import re
+
+import io
 import logging
 import os
-import shutil
+import secrets
+import tempfile
 import time
-import uuid
-from contextlib import suppress
-from typing import Any, Dict, Optional
+import zipfile
+from pathlib import Path
+from typing import Optional
 
-from drive_stitch import stitch_from_drive
-from fastapi import FastAPI, Header, HTTPException
-from manga_downloader import MangaDownloader
-from providers.base_provider import SITE_AUTH, update_site_auth_cache
-from providers.manager import ProviderManager
-from pydantic import BaseModel
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# CUDA/cuDNN Libraries Preloader & Compatibility Self-Restart
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def init_cuda_compatibility():
+    import sys
+    import os
+    
+    # Skip compatibility layers on Hugging Face Spaces to avoid port binding conflicts with os.execve
+    if "SPACE_ID" in os.environ:
+        print("Running inside Hugging Face Spaces. Skipping CUDA compatibility preloader to prevent port conflicts.")
+        return
+        
+    # Only run on Linux
+    if sys.platform != "linux":
+        return
+        
+    if os.environ.get("COMPAT_ENV_SET") == "1":
+        # We are in the restarted process. Just preload the libs.
+        import glob
+        import ctypes
+        print("Preloaded process active. Loading CUDA/cuDNN libraries...")
+        compat_dir = "/tmp/cuda_compat"
+        
+        # Load low-level libs from compat_dir or standard paths
+        libs_to_load = [
+            "libcudart.so.12",
+            "libnvJitLink.so.13",
+            "libnvrtc.so.12",
+            "libcublasLt.so.12",
+            "libcublas.so.12",
+            "libcufft.so.11",
+            "libcurand.so.10",
+            "libcusolver.so.11",
+            "libcusparse.so.12",
+            "libcudnn.so.9"
+        ]
+        
+        site_packages_paths = [p for p in sys.path if "site-packages" in p]
+        nvidia_lib_dirs = []
+        for sp in site_packages_paths:
+            nvidia_dir = os.path.join(sp, "nvidia")
+            if os.path.isdir(nvidia_dir):
+                for sub in os.listdir(nvidia_dir):
+                    lib_dir = os.path.join(nvidia_dir, sub, "lib")
+                    if os.path.isdir(lib_dir):
+                        nvidia_lib_dirs.append(lib_dir)
+        all_paths = [compat_dir] + nvidia_lib_dirs + [
+            "/usr/local/cuda/lib64",
+            "/usr/local/cuda/targets/x86_64-linux/lib",
+            "/usr/lib/x86_64-linux-gnu"
+        ]
+        
+        for libname in libs_to_load:
+            found = False
+            for p in all_paths:
+                matches = glob.glob(os.path.join(p, libname + "*"))
+                if matches:
+                    matches.sort(key=len)
+                    lib_path = matches[0]
+                    try:
+                        ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+                        print(f"Successfully preloaded: {lib_path}")
+                        found = True
+                        break
+                    except Exception as e:
+                        print(f"Failed to preload {lib_path}: {e}")
+            if not found:
+                try:
+                    ctypes.CDLL(libname, mode=ctypes.RTLD_GLOBAL)
+                    print(f"Successfully loaded from system: {libname}")
+                except Exception:
+                    pass
+        return
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("HF-Worker")
-os.environ["HF_WORKER_RUNTIME"] = "1"
-
-app = FastAPI(title="Cat-Bi Worker API")
-
-MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
-JOB_TIMEOUT_SEC = int(os.getenv("JOB_TIMEOUT_SEC", "1800"))
-RETRY_COUNT = int(os.getenv("WORKER_RETRY_COUNT", "1"))
-JOBS_RETENTION_SEC = int(os.getenv("JOBS_RETENTION_SEC", "10800"))  # 3h
-CLEANUP_INTERVAL_SEC = int(os.getenv("CLEANUP_INTERVAL_SEC", "300"))  # 5m
-TEMP_RETENTION_SEC = int(os.getenv("TEMP_RETENTION_SEC", "7200"))  # 2h
-_STARTED_AT = time.time()
-
-jobs: Dict[str, dict] = {}
-job_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=200)
-worker_tasks: list[asyncio.Task] = []
-cleanup_task: asyncio.Task | None = None
-
-# ─────────────────────────────────────────────────────────────────────────
-# Singleton ProviderManager — مشترك بين كل الـ jobs لتجنب إعادة التحميل
-# ─────────────────────────────────────────────────────────────────────────
-_shared_pm: ProviderManager | None = None
-
-
-def _get_pm() -> ProviderManager:
-    global _shared_pm
-    if _shared_pm is None:
-        _shared_pm = ProviderManager()
-    return _shared_pm
-
-
-def _load_auth_from_disk() -> int:
-    """يحمّل بيانات الـ auth من ملفات JSON إلى SITE_AUTH الـ global.
-    يُستدعى عند startup وعند كل /sync_custom_data."""
-    auth_paths = [
-        "data/site_auth_cache.json",
-        "site_auth_cache.json",
+    # First run: create symlinks and restart
+    import glob
+    print("Initializing CUDA compatibility layer...")
+    
+    site_packages_paths = [p for p in sys.path if "site-packages" in p]
+    nvidia_lib_dirs = []
+    for sp in site_packages_paths:
+        nvidia_dir = os.path.join(sp, "nvidia")
+        if os.path.isdir(nvidia_dir):
+            for sub in os.listdir(nvidia_dir):
+                lib_dir = os.path.join(nvidia_dir, sub, "lib")
+                if os.path.isdir(lib_dir):
+                    nvidia_lib_dirs.append(lib_dir)
+                    
+    standard_paths = [
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda/targets/x86_64-linux/lib",
+        "/usr/lib/x86_64-linux-gnu"
     ]
-    for path in auth_paths:
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-                if cache and isinstance(cache, dict):
-                    update_site_auth_cache(cache)
-                    logger.info(
-                        f"[Auth] Loaded {len(cache)} domain(s) from {path}: {list(cache.keys())}"
-                    )
-                    return len(cache)
-            except Exception as e:
-                logger.warning(f"[Auth] Failed to load {path}: {e}")
-    return 0
-
-
-class JobRequest(BaseModel):
-    url: str
-    title: str
-    job_type: str = "manga"  # manga, stitch
-    params: Optional[dict] = None
-
-
-class ExtractRequest(BaseModel):
-    url: str
-
-
-class SyncRequest(BaseModel):
-    custom_sites: dict
-    site_auth: dict
-    custom_selectors: dict = {}
-
-
-class FolderRequest(BaseModel):
-    folder_name: str
-    upload_dest: str
-
-
-class RadarCheckRequest(BaseModel):
-    url: str
-    last_chapter: float = 0
-    max_new: int = 10
-
-
-class RadarCoverRequest(BaseModel):
-    url: str
-
-
-def _new_job(job_id: str, req: JobRequest) -> dict:
-    return {
-        "id": job_id,
-        "job_type": req.job_type,
-        "status": "queued",  # queued|running|completed|failed
-        "progress": 0,
-        "progress_detail": {"step": "queued", "pct": 0},
-        "message": "Queued",
-        "result": None,
-        "error_code": None,
-        "error_details": None,
-        "retries": 0,
-        "created_at": time.time(),
-        "updated_at": time.time(),
+    
+    all_paths = nvidia_lib_dirs + standard_paths
+    
+    compat_dir = "/tmp/cuda_compat"
+    os.makedirs(compat_dir, exist_ok=True)
+    
+    symlink_map = {
+        "libcublasLt.so.12": "libcublasLt.so.13",
+        "libcublas.so.12": "libcublas.so.13",
+        "libcudart.so.12": "libcudart.so.13",
+        "libnvrtc.so.12": "libnvrtc.so.13",
+        "libcufft.so.11": "libcufft.so.12",
+        "libcusolver.so.11": "libcusolver.so.12",
     }
+    
+    for expected, actual in symlink_map.items():
+        actual_path = None
+        for p in all_paths:
+            matches = glob.glob(os.path.join(p, actual + "*"))
+            if matches:
+                matches.sort(key=len)
+                actual_path = matches[0]
+                break
+        if actual_path:
+            dst_link = os.path.join(compat_dir, expected)
+            if not os.path.exists(dst_link):
+                try:
+                    os.symlink(actual_path, dst_link)
+                    print(f"Symlinked {expected} -> {actual_path}")
+                except Exception as e:
+                    print(f"Failed to symlink {expected}: {e}")
+                    
+    # Update environment and restart
+    all_paths = [compat_dir] + all_paths
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = ":".join(all_paths) + (f":{ld_path}" if ld_path else "")
+    os.environ["COMPAT_ENV_SET"] = "1"
+    
+    print(f"Restarting process with updated LD_LIBRARY_PATH: {os.environ['LD_LIBRARY_PATH']}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, [sys.executable] + sys.argv, os.environ)
+
+init_cuda_compatibility()
+
+import cv2
+import gradio as gr
+import numpy as np
+import onnxruntime as ort
+import uvicorn
+from fastapi import Depends, Header, HTTPException, UploadFile, File
+from fastapi.responses import Response
+from huggingface_hub import hf_hub_download
+from PIL import Image
+from ultralytics import YOLO
+import torch
+import torch.nn as nn
+from safetensors.torch import load_file as load_safetensors
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Import spaces (ZeroGPU Decorator)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+try:
+    import spaces
+except ImportError:
+    # Fallback for local testing or dedicated GPU environments
+    class spaces:
+        @staticmethod
+        def GPU(func=None, duration=None):
+            if callable(func):
+                return func
+            def decorator(f):
+                return f
+            return decorator
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Logging
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s â€” %(message)s",
+)
+log = logging.getLogger("manga_cleaner")
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Config
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+API_KEY: str = os.getenv("INPAINTING_API_KEY", "")
+if API_KEY:
+    log.info("API key loaded from environment (first 6 chars): %s...", API_KEY[:6])
+else:
+    log.info("INPAINTING_API_KEY not set in environment. Running in open microservice mode.")
+
+# Switched to segmentation model — returns pixel masks instead of bounding boxes
+YOLO_REPO        = "ogkalu/comic-text-segmenter-yolov8m"
+YOLO_FILE        = "comic-text-segmenter.pt"
+COMIC_DET_REPO   = "mayocream/comic-text-detector-onnx"
+COMIC_DET_FILE   = "comic-text-detector.onnx"
+# AOT-GAN: manga-image-translator AOT inpainting (SafeTensors, 22MB)
+# Replaces LaMa — trained on manga/comic, far better at screentones & gradients
+AOT_REPO         = "mayocream/aot-inpainting"
+AOT_FILE         = "model.safetensors"
+# Keep LaMa constants for backward-compat references (no longer used for inference)
+LAMA_REPO        = "mayocream/lama-manga-onnx"
+LAMA_FILE        = "lama-manga.onnx"
+BUBBLE_SEG_REPO  = "huyvux3005/manga109-segmentation-bubble"
+BUBBLE_SEG_FILE  = "best.pt"
+
+YOLO_CONF      = float(os.getenv("YOLO_CONF",      "0.20"))
+YOLO_IOU       = float(os.getenv("YOLO_IOU",       "0.45"))
+BUBSEG_CONF    = float(os.getenv("BUBSEG_CONF",    "0.30"))
+LAMA_SIZE      = int(os.getenv("LAMA_SIZE",        "512"))
+DILATE_ITER    = int(os.getenv("DILATE_ITER",      "1"))
+C_CONSTANT     = int(os.getenv("C_CONSTANT",       "13"))
+BLUR_RADIUS    = int(os.getenv("BLUR_RADIUS",      "19"))
+MAX_ZIP_MB     = int(os.getenv("MAX_ZIP_MB",       "500"))
+# Minimum connected component area (px²) to keep — removes screentone/noise dots
+MIN_COMP_AREA  = int(os.getenv("MIN_COMP_AREA",   "20"))
+
+# ── Art-protection routing thresholds (see _route_text_masks) ──────────────
+# تُستخدم لفصل المناطق الآمنة للتعبئة الكاملة (خلفية فقاعة مسطحة فاتحة) عن
+# المناطق الحساسة (نص حر/SFX فوق الرسم أو خلفية متدرجة) التي يجب فيها اتّباع
+# شكل الحبر بدقة بدل ملء صندوق كامل — لحماية رسم الشخصيات من "الأكل".
+SAFE_BUBBLE_BORDER     = int(os.getenv("SAFE_BUBBLE_BORDER", "5"))
+UNIFORM_LIGHT_STD      = float(os.getenv("UNIFORM_LIGHT_STD", "12.0"))
+UNIFORM_LIGHT_GRADIENT = float(os.getenv("UNIFORM_LIGHT_GRADIENT", "8.0"))
+COMPLEX_FEATHER_RADIUS = float(os.getenv("COMPLEX_FEATHER_RADIUS", "2.5"))
+
+# Global model handles
+yolo_model: Optional[YOLO] = None
+comic_det_session: Optional[ort.InferenceSession] = None
+lama_session: Optional[ort.InferenceSession] = None  # LaMa Manga ONNX
+aot_model = None  # AOT-GAN removed — not used
+bubble_seg_model: Optional[YOLO] = None
+sd_pipe = None   # StableDiffusionInpaintPipeline for background reconstruction
 
 
-def _update_job(job_id: str, **kwargs):
-    j = jobs.get(job_id)
-    if not j:
-        return
-    j.update(kwargs)
-    j["updated_at"] = time.time()
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Model Loading Helper (Lazy Loading on First Use)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def ensure_models_loaded():
+    global yolo_model, comic_det_session, lama_session, aot_model, bubble_seg_model, sd_pipe
 
+    if yolo_model is None:
+        log.info("Loading YOLOv8 text segmenter …")
+        try:
+            yolo_path = hf_hub_download(repo_id=YOLO_REPO, filename=YOLO_FILE)
+            yolo_model = YOLO(yolo_path)
+            if torch.cuda.is_available():
+                try:
+                    yolo_model.to(0)
+                except Exception:
+                    pass
+            log.info("YOLOv8 text segmenter loaded successfully.")
+        except Exception as exc:
+            log.error("YOLO load failed: %s", exc)
 
-def verify_token(authorization: str = Header(None), x_worker_key: str = Header(None)):
-    expected = os.getenv("HF_WORKER_KEY") or os.getenv("WEB_PANEL_SECRET")
-    if not expected:
-        return
-    if x_worker_key and x_worker_key == expected:
-        return
-    if authorization:
-        if expected in authorization or authorization == f"Bearer {expected}" or "Bearer hf_" in authorization:
-            return
-    if os.getenv("HF_WORKER_RUNTIME") == "1" or os.getenv("SPACE_ID"):
-        return
-    raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-@app.on_event("startup")
-async def startup_event():
-    global cleanup_task
-
-    # ── 1. تحميل auth من الملفات فوراً حتى قبل أي job ─────────────────
-    loaded = _load_auth_from_disk()
-    if loaded:
-        logger.info(f"[Startup] Auth loaded for {loaded} domain(s) from disk")
-    else:
-        logger.warning(
-            "[Startup] No auth found on disk — will retry when /sync_custom_data is called"
-        )
-
-    # ── 2. تهيئة الـ Singleton ProviderManager وتحميل المواقع المخصصة ─
-    pm = _get_pm()
-    try:
-        await pm._load_custom_sites()
-        logger.info("[Startup] ProviderManager custom sites loaded")
-    except Exception as e:
-        logger.warning(f"[Startup] ProviderManager load warning: {e}")
-
-    # ── 3. تشغيل الـ workers ────────────────────────────────────────────
-    for i in range(MAX_CONCURRENT_JOBS):
-        worker_tasks.append(
-            asyncio.create_task(_job_worker_loop(i), name=f"job-worker-{i}")
-        )
-    cleanup_task = asyncio.create_task(_cleanup_loop(), name="cleanup-loop")
-    logger.info(f"Workers started: {MAX_CONCURRENT_JOBS}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global cleanup_task
-    for t in worker_tasks:
-        t.cancel()
-    for t in worker_tasks:
-        with suppress(Exception):
-            await t
-    worker_tasks.clear()
-    if cleanup_task:
-        cleanup_task.cancel()
-        with suppress(Exception):
-            await cleanup_task
-        cleanup_task = None
-
-
-@app.get("/")
-async def root():
-    return {"status": "online", "message": "Cat-Bi Worker is running"}
-
-
-@app.get("/health")
-async def health():
-    running = sum(1 for j in jobs.values() if j.get("status") == "running")
-    queued = sum(1 for j in jobs.values() if j.get("status") == "queued")
-    return {
-        "status": "ok",
-        "uptime_sec": int(time.time() - _STARTED_AT),
-        "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
-        "running_jobs": running,
-        "queued_jobs": queued,
-        "queue_size": job_queue.qsize(),
-        "total_jobs_in_memory": len(jobs),
-    }
-
-
-@app.post("/create_folder")
-async def create_folder(req: FolderRequest, authorization: str = Header(None)):
-    verify_token(authorization)
-    downloader = MangaDownloader()
-    if req.upload_dest == "Gofile":
-        f_info = await downloader.create_gofile_folder(req.folder_name)
-        if f_info:
-            return {
-                "ok": True,
-                "folder_id": f_info["id"],
-                "link": f"https://gofile.io/d/{f_info['code']}",
-            }
-    elif req.upload_dest == "Drive":
-        f_info = await downloader.create_gdrive_folder(req.folder_name)
-        if f_info:
-            return {
-                "ok": True,
-                "folder_id": f_info["id"],
-                "link": f_info.get("webViewLink"),
-            }
-    return {"ok": False, "error": "Failed to create folder or invalid destination"}
-
-
-@app.post("/extract/chapters")
-async def extract_chapters(req: ExtractRequest, authorization: str = Header(None)):
-    verify_token(authorization)
-    pm = ProviderManager()
-    chapters = await pm.get_all_chapters(req.url)
-    out = {str(k): v for k, v in (chapters or {}).items()}
-    return {"ok": True, "count": len(out), "chapters": out}
-
-
-@app.post("/extract/images")
-async def extract_images(req: ExtractRequest, authorization: str = Header(None)):
-    verify_token(authorization)
-    pm = ProviderManager()
-    images = await pm.get_images(req.url)
-    return {"ok": True, "count": len(images or []), "images": images or []}
-
-
-@app.post("/radar/check")
-async def radar_check(req: RadarCheckRequest, authorization: str = Header(None)):
-    """
-    Endpoint خفيف للرادار: يرجع فقط آخر فصل + الفصول الجديدة مقارنة بـ last_chapter
-    مع معلومات القفل قدر الإمكان.
-    """
-    verify_token(authorization)
-    try:
-        pm = ProviderManager()
-        rich = await pm.get_chapters_with_lock_info(req.url)
-        if not rich:
-            return {"ok": False, "error": "no-chapters"}
-
-        keys = sorted([float(k) for k in rich.keys()])
-        latest = max(keys) if keys else 0
-
-        last = float(req.last_chapter or 0)
-        new_nums = [n for n in keys if n > last]
-        # لا نرسل عدد ضخم في كل مرة
-        if req.max_new and req.max_new > 0:
-            new_nums = new_nums[: int(req.max_new)]
-
-        def _info(num: float) -> dict:
-            info = rich.get(num)
-            if isinstance(info, dict):
-                return {
-                    "num": float(num),
-                    "url": info.get("url", ""),
-                    "locked": bool(info.get("locked")),
-                    "reason": info.get("reason", ""),
-                    **(
-                        {"unlock_time": info.get("unlock_time")}
-                        if info.get("unlock_time")
-                        else {}
-                    ),
-                }
-            return {
-                "num": float(num),
-                "url": str(info or ""),
-                "locked": False,
-                "reason": "plain",
-            }
-
-        new_chapters = [_info(n) for n in new_nums]
-        latest_info = (
-            _info(latest) if latest else {"num": 0, "url": "", "locked": False}
-        )
-
-        return {
-            "ok": True,
-            "latest": latest,
-            "latest_info": latest_info,
-            "new_count": len(new_chapters),
-            "new_chapters": new_chapters,
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}
-
-
-@app.post("/radar/cover")
-async def radar_cover(req: RadarCoverRequest, authorization: str = Header(None)):
-    """يرجع رابط غلاف السلسلة."""
-    verify_token(authorization)
-    try:
-        pm = ProviderManager()
-        cover = await pm.get_series_cover(req.url)
-        return {"ok": True, "cover_url": cover or ""}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}
-
-
-@app.post("/sync_custom_data")
-async def sync_custom_data(req: SyncRequest, authorization: str = Header(None)):
-    verify_token(authorization)
-    try:
-        os.makedirs("data", exist_ok=True)
-        with open("data/custom_sites_cache.json", "w", encoding="utf-8") as f:
-            json.dump(req.custom_sites, f, ensure_ascii=False, indent=2)
-        with open("data/site_auth_cache.json", "w", encoding="utf-8") as f:
-            json.dump(req.site_auth, f, ensure_ascii=False, indent=2)
-        with open("data/custom_selectors_cache.json", "w", encoding="utf-8") as f:
-            json.dump(req.custom_selectors or {}, f, ensure_ascii=False, indent=2)
-
-        # تحديث SITE_AUTH الـ global فوراً (بدون انتظار lazy load)
-        if req.site_auth:
-            update_site_auth_cache(req.site_auth)
-            logger.info(
-                f"[Sync] Updated SITE_AUTH for {len(req.site_auth)} domain(s): {list(req.site_auth.keys())}"
+    if comic_det_session is None:
+        log.info("Loading ComicTextDetector ONNX model …")
+        try:
+            det_path = hf_hub_download(repo_id=COMIC_DET_REPO, filename=COMIC_DET_FILE)
+            providers = ["CPUExecutionProvider"]
+            if torch.cuda.is_available() or "CUDAExecutionProvider" in ort.get_available_providers():
+                providers.insert(0, ("CUDAExecutionProvider", {"device_id": 0}))
+            sess_opts = ort.SessionOptions()
+            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_opts.enable_mem_pattern = True
+            comic_det_session = ort.InferenceSession(
+                det_path, sess_options=sess_opts, providers=providers
             )
+            log.info("ComicTextDetector loaded — providers: %s", comic_det_session.get_providers())
+        except Exception as exc:
+            log.error("ComicTextDetector load failed: %s", exc)
 
-        # تحديث الـ Singleton ProviderManager
-        pm = _get_pm()
-        pm._custom_loaded = False  # أجبره على إعادة التحميل
-        await pm.reload_custom_sites()
-        return {
-            "ok": True,
-            "message": "Custom sites and auth synchronized and reloaded",
-            "auth_domains": list(req.site_auth.keys()),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    if lama_session is None:
+        log.info("Loading LaMa ONNX model …")
+        try:
+            lama_path = hf_hub_download(repo_id=LAMA_REPO, filename=LAMA_FILE)
+            providers = ["CPUExecutionProvider"]
+            if torch.cuda.is_available() or "CUDAExecutionProvider" in ort.get_available_providers():
+                providers.insert(0, ("CUDAExecutionProvider", {"device_id": 0}))
+            sess_opts = ort.SessionOptions()
+            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_opts.enable_mem_pattern = True
+            lama_session = ort.InferenceSession(
+                lama_path, sess_options=sess_opts, providers=providers
+            )
+            log.info("LaMa ONNX loaded — providers: %s", lama_session.get_providers())
+        except Exception as exc:
+            log.error("LaMa load failed: %s", exc)
+
+    if bubble_seg_model is None:
+        log.info("Loading bubble segmentation model (manga109-segmentation-bubble) ...")
+        try:
+            bubble_seg_path = hf_hub_download(repo_id=BUBBLE_SEG_REPO, filename=BUBBLE_SEG_FILE)
+            bubble_seg_model = YOLO(bubble_seg_path)
+            if torch.cuda.is_available():
+                try:
+                    bubble_seg_model.to(0)
+                except Exception:
+                    pass
+            log.info("Bubble seg model loaded. task=%s", getattr(bubble_seg_model, "task", "unknown"))
+        except Exception as exc:
+            log.error("Bubble seg model load failed (non-fatal): %s", exc)
+
+    if sd_pipe is None:
+        log.info("Loading Stable Diffusion 2 Inpainting pipeline ...")
+        try:
+            from diffusers import StableDiffusionInpaintPipeline
+            sd_pipe = StableDiffusionInpaintPipeline.from_pretrained(
+                "stabilityai/stable-diffusion-2-inpainting",
+                torch_dtype=torch.float16,
+                safety_checker=None,
+                requires_safety_checker=False,
+            )
+            sd_pipe = sd_pipe.to("cuda")
+            sd_pipe.set_progress_bar_config(disable=True)
+            # Speed optimisations
+            sd_pipe.enable_attention_slicing()
+            log.info("SD2 Inpainting pipeline loaded on CUDA")
+        except Exception as exc:
+            log.error("SD2 Inpainting load failed (will fall back to Telea): %s", exc)
+            sd_pipe = None
 
 
-@app.post("/jobs")
-async def create_job(req: JobRequest, authorization: str = Header(None)):
-    verify_token(authorization)
-    if req.job_type not in ("manga", "stitch"):
-        raise HTTPException(status_code=400, detail="Invalid job_type")
-    if job_queue.full():
-        raise HTTPException(status_code=429, detail="Queue is full")
 
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = _new_job(job_id, req)
-    await job_queue.put({"job_id": job_id, "req": req})
-    return {"job_id": job_id, "status": "queued"}
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
 
 
-@app.get("/jobs/{job_id}")
-async def get_job(job_id: str, authorization: str = Header(None)):
-    verify_token(authorization)
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+qwen_model = None
+qwen_processor = None
 
+def _normalize_lang(lang: str) -> str:
+    lang = (lang or "auto").strip().lower()
+    if lang in {"ko", "korean", "ko_kr"}:
+        return "ko"
+    if lang in {"ja", "japanese", "japan", "ja_jp"}:
+        return "ja"
+    if lang in {"en", "english", "en_us"}:
+        return "en"
+    if lang in {"ar", "arabic"}:
+        return "ar"
+    if lang in {"zh", "chinese", "zh_cn"}:
+        return "zh"
+    return "auto"
 
-@app.get("/jobs")
-async def list_jobs(authorization: str = Header(None)):
-    verify_token(authorization)
-    return jobs
-
-
-
-async def _job_worker_loop(worker_index: int):
-    while True:
-        payload = await job_queue.get()
-        job_id = payload["job_id"]
-        req: JobRequest = payload["req"]
-        _update_job(
-            job_id,
-            status="running",
-            message=f"Running on worker-{worker_index}",
-            progress=0,
-            progress_detail={"step": "starting", "pct": 0},
+def ensure_ocr_loaded():
+    global qwen_model, qwen_processor
+    if qwen_model is not None:
+        return
+        
+    import torch
+    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+    
+    log.info("Loading Qwen2-VL-2B-Instruct on CPU (ZeroGPU will handle CUDA redirection)...")
+    try:
+        qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen2-VL-2B-Instruct",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            device_map="auto"
         )
-
-        attempt = 0
-        while True:
-            try:
-                if req.job_type == "manga":
-                    await asyncio.wait_for(
-                        _run_manga_job(job_id, req.url, req.title, req.params or {}),
-                        timeout=JOB_TIMEOUT_SEC,
-                    )
-                else:
-                    await asyncio.wait_for(
-                        _run_stitch_job(job_id, req.url, req.title, req.params or {}),
-                        timeout=JOB_TIMEOUT_SEC,
-                    )
-                break
-            except asyncio.TimeoutError:
-                attempt += 1
-                if attempt <= RETRY_COUNT:
-                    _update_job(
-                        job_id,
-                        retries=attempt,
-                        message=f"Timeout, retry {attempt}/{RETRY_COUNT}",
-                    )
-                    continue
-                _update_job(
-                    job_id,
-                    status="failed",
-                    error_code="timeout",
-                    error_details=f"Job timed out after {JOB_TIMEOUT_SEC}s",
-                    message="Timeout",
-                    progress=100,
-                    progress_detail={"step": "failed", "pct": 100},
-                )
-                break
-            except Exception as e:
-                attempt += 1
-                if attempt <= RETRY_COUNT:
-                    _update_job(
-                        job_id,
-                        retries=attempt,
-                        message=f"Error, retry {attempt}/{RETRY_COUNT}: {str(e)[:120]}",
-                    )
-                    continue
-                _update_job(
-                    job_id,
-                    status="failed",
-                    error_code="internal_error",
-                    error_details=str(e),
-                    message=str(e),
-                    progress=100,
-                    progress_detail={"step": "failed", "pct": 100},
-                )
-                logger.exception(f"Job {job_id} failed")
-                break
-        job_queue.task_done()
+        qwen_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
+        log.info("Qwen2-VL-2B-Instruct loaded successfully.")
+    except Exception as e:
+        log.error("Failed to load Qwen2-VL-2B-Instruct: %s", e)
+        raise e
 
 
-def _cleanup_old_jobs():
-    now = time.time()
-    to_delete = []
-    for job_id, job in jobs.items():
-        status = job.get("status")
-        updated_at = job.get("updated_at", now)
-        if (
-            status in ("completed", "failed")
-            and (now - updated_at) > JOBS_RETENTION_SEC
-        ):
-            to_delete.append(job_id)
-    for job_id in to_delete:
-        jobs.pop(job_id, None)
-    if to_delete:
-        logger.info(f"Cleanup removed {len(to_delete)} old jobs")
+def _sort_bubbles_reading_order(bubbles: list[dict], lang: str = "auto") -> list[dict]:
+    if not bubbles:
+        return []
 
-
-def _cleanup_temp_paths():
-    now = time.time()
-    temp_roots = ["temp_downloads", "tmp", "/tmp"]
-    removed = 0
-    for root in temp_roots:
-        if not os.path.exists(root):
+    items = []
+    for bubble in bubbles:
+        bbox = bubble.get("bbox") or []
+        if len(bbox) != 4:
+            items.append({**bubble, "center_x": 0.0, "center_y": 0.0, "height": 0.0})
             continue
+        xs = [pt[0] for pt in bbox]
+        ys = [pt[1] for pt in bbox]
+        items.append({
+            **bubble,
+            "center_x": sum(xs) / 4.0,
+            "center_y": sum(ys) / 4.0,
+            "height": max(ys) - min(ys),
+        })
+
+    items.sort(key=lambda it: it["center_y"])
+
+    bands = []
+    for item in items:
+        added = False
+        for band in bands:
+            band_avg_y = sum(it["center_y"] for it in band) / len(band)
+            band_avg_h = sum(it["height"] for it in band) / len(band)
+            threshold = max(band_avg_h * 0.7, 30.0)
+            if abs(item["center_y"] - band_avg_y) < threshold:
+                band.append(item)
+                added = True
+                break
+        if not added:
+            bands.append([item])
+
+    sorted_items = []
+    reverse_x = lang in {"ja", "ar"}
+    for band in bands:
+        band.sort(key=lambda it: it["center_x"], reverse=reverse_x)
+        sorted_items.extend(band)
+
+    return [dict(item) for item in sorted_items]
+
+
+def _get_bubble_overlap(bbox1, bbox2) -> float:
+    xs1 = [pt[0] for pt in bbox1]
+    ys1 = [pt[1] for pt in bbox1]
+    xs2 = [pt[0] for pt in bbox2]
+    ys2 = [pt[1] for pt in bbox2]
+    
+    x_min1, y_min1, x_max1, y_max1 = min(xs1), min(ys1), max(xs1), max(ys1)
+    x_min2, y_min2, x_max2, y_max2 = min(xs2), min(ys2), max(xs2), max(ys2)
+    
+    x_int_min = max(x_min1, x_min2)
+    y_int_min = max(y_min1, y_min2)
+    x_int_max = min(x_max1, x_max2)
+    y_int_max = min(y_max1, y_max2)
+    
+    if x_int_max <= x_int_min or y_int_max <= y_int_min:
+        return 0.0
+        
+    area_int = (x_int_max - x_int_min) * (y_int_max - y_int_min)
+    area1 = (x_max1 - x_min1) * (y_max1 - y_min1)
+    area2 = (x_max2 - x_min2) * (y_max2 - y_min2)
+    
+    union_area = area1 + area2 - area_int
+    if union_area <= 0:
+        return 0.0
+    return area_int / union_area
+
+
+@spaces.GPU(duration=120)
+def process_ocr_batch(images_data: list[bytes], lang: str = "auto", remove_sfx: bool = False, connected_slashes: bool = False) -> list[dict]:
+    ensure_models_loaded()
+    results = []
+    normalized_lang = _normalize_lang(lang)
+    lang_names = {
+        "ko": "Korean",
+        "ja": "Japanese",
+        "zh": "Chinese",
+        "ar": "Arabic",
+        "en": "English",
+        "auto": "the primary language of the text"
+    }
+    target_lang_name = lang_names.get(normalized_lang, "the primary language of the text")
+
+    prompt_text = (
+        f"Identify the bubble style in this image and transcribe the {target_lang_name} text.\n"
+        "Choose the correct prefix symbol based on these visual rules:\n"
+        '- "": Normal speech bubble (oval/round border)\n'
+        '- (): Thought bubble (cloud-shaped or tail-less border)\n'
+        '- []: Narration box (rectangular/square border)\n'
+        '- OT: Outside text (no border, text is directly on the artwork)\n'
+        '- ST: Small text (tiny handwritten comments/noises next to main bubbles)\n'
+        '- SFX: Sound effects (artistic drawn lettering, e.g., Boom, Vroom)\n'
+        '- <>: System screen (digital RPG status window or menu box)\n'
+        '- :: Screaming bubble (jagged, thorny, or spiky border)\n\n'
+        "Output format must be exactly: Symbol: TranscribedText\n"
+        "Output nothing else."
+    )
+
+    allowed_classes = {0, 1, 2, 3, 5} if remove_sfx else {0, 1, 2, 3, 4, 5}
+
+    for idx, raw in enumerate(images_data):
         try:
-            for name in os.listdir(root):
-                path = os.path.join(root, name)
-                with suppress(Exception):
-                    mtime = os.path.getmtime(path)
-                    if (now - mtime) <= TEMP_RETENTION_SEC:
+            nparr = np.frombuffer(raw, np.uint8)
+            img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                results.append({"page_num": idx + 1, "texts": []})
+                continue
+                
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            H, W = img_rgb.shape[:2]
+            
+            # Slice long vertical manhwa/webtoon images to avoid aspect ratio distortion in YOLO
+            slices = []
+            if H / W >= 2.0 and W > 0:
+                tile_h = min(H, max(1280, W * 2))
+                overlap = 350
+                stride = tile_h - overlap
+                if stride <= 0:
+                    slices.append((0, H))
+                else:
+                    y_start = 0
+                    while y_start < H:
+                        y_end = min(y_start + tile_h, H)
+                        if y_end == H and y_start > 0:
+                            y_start = max(0, H - tile_h)
+                        slices.append((y_start, y_end))
+                        if y_end == H:
+                            break
+                        y_start += stride
+            else:
+                slices.append((0, H))
+            
+            bubble_crops = []
+            for y_start, y_end in slices:
+                chunk = img_rgb[y_start:y_end, :]
+                chunk_h, chunk_w = chunk.shape[:2]
+                if chunk_h == 0 or chunk_w == 0:
+                    continue
+                
+                yolo_res = yolo_model.predict(
+                    source=chunk,
+                    conf=0.15,
+                    iou=YOLO_IOU,
+                    verbose=False,
+                    device="cuda"
+                )
+                
+                raw_boxes: list[tuple[int, int, int, int, float]] = []
+                for r in yolo_res:
+                    if r.boxes is None:
                         continue
-                    if os.path.isdir(path):
-                        shutil.rmtree(path, ignore_errors=True)
+                    for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
+                        if int(cls) not in allowed_classes or conf < 0.15:
+                            continue
+                        x_min, y_min, x_max, y_max = map(int, box.cpu().numpy())
+                        raw_boxes.append((x_min, y_min, x_max, y_max, float(conf)))
+
+                for bx_min, by_min, bx_max, by_max, bconf in raw_boxes:
+                    bw_box = bx_max - bx_min
+                    bh_box = by_max - by_min
+
+                    # --- Adaptive padding: capped by half the distance to nearest neighbour ---
+                    # Base padding is 5 % of the bubble dimension to keep crops tight.
+                    # We clamp it to half the gap to the closest neighbour so two adjacent bubbles
+                    # never overlap in the crop, preventing text bleeding.
+                    base_pad_x = max(4, int(bw_box * 0.05))
+                    base_pad_y = max(4, int(bh_box * 0.05))
+
+                    min_gap_x = chunk_w   # sentinel
+                    min_gap_y = chunk_h
+                    for ox_min, oy_min, ox_max, oy_max, _ in raw_boxes:
+                        if (ox_min, oy_min, ox_max, oy_max) == (bx_min, by_min, bx_max, by_max):
+                            continue
+                        # Horizontal gap (only relevant if boxes are on the same row)
+                        if oy_min < by_max and oy_max > by_min:   # vertical overlap exists
+                            if ox_min > bx_max:
+                                min_gap_x = min(min_gap_x, ox_min - bx_max)
+                            elif ox_max < bx_min:
+                                min_gap_x = min(min_gap_x, bx_min - ox_max)
+                        # Vertical gap
+                        if ox_min < bx_max and ox_max > bx_min:   # horizontal overlap exists
+                            if oy_min > by_max:
+                                min_gap_y = min(min_gap_y, oy_min - by_max)
+                            elif oy_max < by_min:
+                                min_gap_y = min(min_gap_y, by_min - oy_max)
+
+                    # Use at most half the gap so we never reach a neighbour's territory
+                    safe_pad_x = min(base_pad_x, max(1, min_gap_x // 2))
+                    safe_pad_y = min(base_pad_y, max(1, min_gap_y // 2))
+
+                    x_min = max(0, bx_min - safe_pad_x)
+                    y_min = max(0, by_min - safe_pad_y)
+                    x_max = min(chunk_w, bx_max + safe_pad_x)
+                    y_max = min(chunk_h, by_max + safe_pad_y)
+
+                    if x_max <= x_min or y_max <= y_min:
+                        continue
+
+                    crop = chunk[y_min:y_max, x_min:x_max]
+
+                    # Upscale small images to improve OCR quality
+                    h, w = crop.shape[:2]
+                    if w < 250 or h < 250:
+                        scale = 300.0 / min(w, h)
+                        new_w = int(w * scale)
+                        new_h = int(h * scale)
+                        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+                    bubble_crops.append((crop, x_min, y_min, x_max, y_max, y_start, bconf))
+
+            bubbles = []
+            if bubble_crops:
+                from PIL import Image
+                batch_messages = []
+                for crop, _, _, _, _, _, _ in bubble_crops:
+                    pil_crop = Image.fromarray(crop)
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": pil_crop},
+                                {"type": "text", "text": prompt_text},
+                            ],
+                        }
+                    ]
+                    batch_messages.append(messages)
+                
+                # Run Qwen2-VL inference
+                texts = [qwen_processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batch_messages]
+                from qwen_vl_utils import process_vision_info
+                image_inputs, video_inputs = process_vision_info(batch_messages)
+                
+                import torch
+                with torch.no_grad():
+                    inputs = qwen_processor(
+                        text=texts,
+                        images=image_inputs,
+                        videos=video_inputs,
+                        padding=True,
+                        return_tensors="pt",
+                    ).to("cuda")
+                    
+                    generated_ids = qwen_model.generate(**inputs, max_new_tokens=128)
+                    generated_ids_trimmed = [
+                        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                    ]
+                    output_texts = qwen_processor.batch_decode(
+                        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    )
+                
+                # Map outputs back to bubbles
+                for (crop, x_min, y_min, x_max, y_max, y_start, conf), transcribed_text in zip(bubble_crops, output_texts):
+                    orig_lines = [line.strip() for line in transcribed_text.split("\n") if line.strip()]
+                    # Join lines with double slash if connected_slashes is enabled
+                    if connected_slashes:
+                        text_clean = " // ".join(orig_lines)
                     else:
-                        os.remove(path)
-                    removed += 1
-        except Exception as e:
-            logger.warning(f"Temp cleanup issue in {root}: {e}")
-    if removed:
-        logger.info(f"Cleanup removed {removed} temp paths")
+                        text_clean = " ".join(orig_lines)
+                        
+                    if not text_clean:
+                        continue
+                        
+                    # Build bubble dictionary
+                    bubble_bbox = [[x_min, y_min + y_start], [x_max, y_min + y_start], [x_max, y_max + y_start], [x_min, y_max + y_start]]
+                    bubbles.append({
+                        "bbox": bubble_bbox,
+                        "text": text_clean,
+                        "confidence": round(float(conf), 3),
+                        "line_count": len(orig_lines),
+                        "reader_lang": normalized_lang,
+                    })
+
+            # De-duplicate overlapping bubbles (e.g. from overlap regions)
+            merged_bubbles = []
+            for b in bubbles:
+                dup = False
+                for mb in merged_bubbles:
+                    if _get_bubble_overlap(b["bbox"], mb["bbox"]) > 0.4:
+                        dup = True
+                        if b["confidence"] > mb["confidence"]:
+                            mb["bbox"] = b["bbox"]
+                            mb["text"] = b["text"]
+                            mb["confidence"] = b["confidence"]
+                            mb["line_count"] = b["line_count"]
+                            mb["reader_lang"] = b["reader_lang"]
+                        break
+                if not dup:
+                    merged_bubbles.append(b)
+            bubbles = merged_bubbles
+
+            bubbles = _sort_bubbles_reading_order(bubbles, lang=normalized_lang)
+            for bubble_idx, bubble in enumerate(bubbles, start=1):
+                bubble["bubble_num"] = bubble_idx
+
+            texts_only = [bubble["text"] for bubble in bubbles]
+            results.append({
+                "page_num": idx + 1,
+                "bubble_count": len(bubbles),
+                "bubbles": bubbles,
+                "texts": texts_only,
+            })
+        except Exception as exc:
+            import traceback
+            log.warning("Batch OCR error on index %d: %s\n%s", idx, exc, traceback.format_exc())
+            results.append({"page_num": idx + 1, "bubble_count": 0, "bubbles": [], "texts": []})
+            
+    return results
+
+def _is_scanlation_watermark(x: int, y: int, bw: int, bh: int, w: int, h: int) -> bool:
+    margin_y_bottom = int(h * 0.06) if h > 2000 else int(h * 0.08)
+    margin_y_top = int(h * 0.04) if h > 2000 else int(h * 0.06)
+    
+    is_bottom_corner = (y + bh >= h - margin_y_bottom) and (x <= 35 or x + bw >= w - 35) and bh <= 55
+    is_top_corner = (y <= margin_y_top) and (x <= 35 or x + bw >= w - 35) and bh <= 50
+    is_side_ribbon = (x <= 25 or x + bw >= w - 25) and (15 <= bh <= 55) and (70 <= bw <= 380)
+    
+    return is_bottom_corner or is_top_corner or is_side_ribbon
 
 
-async def _cleanup_loop():
-    while True:
+def _filter_scanlation_watermarks(mask: np.ndarray, w: int, h: int) -> np.ndarray:
+    """Preserves scanlation group watermarks/credit badges in outer margins and corners (e.g. ASURASCANS.COM).
+    Guarantees credit watermarks and panel ribbons are not erased while cleaning dialog/SFX/titles.
+    """
+    if mask is None or mask.max() == 0:
+        return mask
+    contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    clean_mask = np.zeros_like(mask)
+    
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if _is_scanlation_watermark(x, y, bw, bh, w, h):
+            log.info("Preserving scanlation credit watermark at (%d, %d, %d, %d)", x, y, bw, bh)
+            continue
+        cv2.drawContours(clean_mask, [cnt], -1, 255, -1)
+    return clean_mask
+
+
+def _build_comic_detector_mask(image_bgr: np.ndarray) -> np.ndarray:
+    """Runs mayocream/comic-text-detector-onnx sliding window over the image.
+    Uses context-aware Ultimate Hybrid masking (Line Envelope for titles/cards + Adaptive Radial for overlays).
+    """
+    if comic_det_session is None:
+        return np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+    h, w = image_bgr.shape[:2]
+    tile_size = 1024
+    overlap = 256
+    stride = tile_size - overlap
+    
+    full_mask = np.zeros((h, w), dtype=np.float32)
+    
+    y_coords = []
+    y = 0
+    while y < h:
+        y_coords.append(min(y, max(0, h - tile_size)))
+        if y + tile_size >= h:
+            break
+        y += stride
+    if not y_coords:
+        y_coords = [0]
+        
+    x_coords = []
+    x = 0
+    while x < w:
+        x_coords.append(min(x, max(0, w - tile_size)))
+        if x + tile_size >= w:
+            break
+        x += stride
+    if not x_coords:
+        x_coords = [0]
+        
+    for y0 in y_coords:
+        for x0 in x_coords:
+            y1 = min(h, y0 + tile_size)
+            x1 = min(w, x0 + tile_size)
+            tile = image_bgr[y0:y1, x0:x1]
+            th, tw = tile.shape[:2]
+            
+            padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
+            padded[:th, :tw] = tile
+            
+            rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+            input_tensor = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[np.newaxis, ...]
+            
+            outputs = comic_det_session.run(None, {"images": input_tensor})
+            blk, seg, det = outputs
+            
+            tile_seg = seg[0, 0, :th, :tw]
+            tile_det = det[0, 0, :th, :tw]
+            tile_combined = np.maximum(tile_seg, tile_det)
+            
+            full_mask[y0:y1, x0:x1] = np.maximum(full_mask[y0:y1, x0:x1], tile_combined)
+            
+    raw_binary = (full_mask > 0.15).astype(np.uint8) * 255
+    
+    # 1. Connect nearby strokes horizontally into text line candidates
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+    connected_lines = cv2.dilate(raw_binary, h_kernel, iterations=1)
+    contours, _ = cv2.findContours(connected_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    hybrid_mask = np.zeros_like(raw_binary)
+    for cnt in contours:
+        x, y_box, bw, bh = cv2.boundingRect(cnt)
+        if bw < 5 or bh < 5:
+            continue
+        
+        # Check if watermark
+        if _is_scanlation_watermark(x, y_box, bw, bh, w, h):
+            continue
+            
+        font_dim = max(bw, bh)
+        aspect = bw / float(bh)
+        
+        # Wide lines / titles / cards: Use Line Envelope Box (absorbs all outer glow & drop shadows)
+        if (bw >= 35 and aspect >= 1.5) or (bw >= 70):
+            pad_x = min(12, max(6, int(bw * 0.04)))
+            pad_y = min(10, max(5, int(bh * 0.15)))
+            x0 = max(0, x - pad_x)
+            y0 = max(0, y_box - pad_y)
+            x1 = min(w, x + bw + pad_x)
+            y1 = min(h, y_box + bh + pad_y)
+            cv2.rectangle(hybrid_mask, (x0, y0), (x1, y1), 255, -1)
+        else:
+            # Over character body / small text: Adaptive Elliptical Radial Dilation
+            cnt_mask = np.zeros_like(raw_binary)
+            cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+            
+            if font_dim > 50:
+                k_size = 17
+            elif font_dim > 25:
+                k_size = 11
+            else:
+                k_size = 7
+                
+            k_rad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+            dil = cv2.dilate(cnt_mask, k_rad, iterations=1)
+            hybrid_mask = cv2.bitwise_or(hybrid_mask, dil)
+        
+    return hybrid_mask
+
+
+def _dilation_iterations(dilate_iter: int) -> int:
+    """يحوّل قيمة dilate_iter (1-15 من سلايدر البوت/الـ Space) إلى عدد مرات توسيع فعلي.
+    القيمة الافتراضية 3 تُعطي iterations=1 (تطابق تماماً السلوك القديم قبل هذا التعديل
+    لضمان التوافق العكسي). القيم الأقل تُقلّل التوسيع لحماية رسم الشخصيات (تصل لصفر
+    توسيع عند 1)، والقيم الأعلى تزيده تدريجياً حتى 5 عند 15 للصفحات الصعبة."""
+    d = max(1, min(15, int(dilate_iter)))
+    return max(0, round((d - 1) * (5.0 / 14.0)))
+
+
+# ──────────────────────────────────────────────
+# Art-Protection Routing Helpers
+# ──────────────────────────────────────────────
+# تفصل هذه الدوال بين مناطق آمنة 100% للتعبئة الكاملة (خلفية فقاعة كلام مسطحة
+# وفاتحة) ومناطق حساسة يجب فيها اتّباع شكل الحبر فقط بدل مستطيل كامل حتى لا
+# يُمسح جزء من رسم الشخصية — وهو ما يحدث كثيراً مع الـSFX/النص الحر في
+# المانهوا الكورية المرسوم مباشرة فوق الرسم بدون فقاعة كلام حقيقية.
+
+def _safe_bubble_interior(
+    interior_mask, safe_border: int = SAFE_BUBBLE_BORDER
+):
+    """يقلّص منطقة داخل الفقاعة/الصندوق بمقدار حدّ أمان (بكسل) بعيداً عن حافتها
+    الخارجية، حتى لا تُعامَل حافة الفقاعة أو خط الإطار نفسه كخلفية آمنة للتعبئة."""
+    if interior_mask is None or interior_mask.max() == 0:
+        return interior_mask
+    k = max(1, int(safe_border))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+    return cv2.erode(interior_mask, kernel, iterations=1, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _component_background_is_uniform_light(
+    image_bgr: np.ndarray,
+    mask_component: np.ndarray,
+    std_thresh: float = UNIFORM_LIGHT_STD,
+    grad_thresh: float = UNIFORM_LIGHT_GRADIENT,
+) -> bool:
+    """يفحص إن كانت الخلفية المحيطة بقطعة نص واحدة مسطحة وفاتحة (فقاعة كلام
+    عادية بيضاء) → آمن نملأها بالكامل. أي تدرج لوني أو خلفية داكنة/رسم تُرجع
+    False (منطقة حساسة يجب حمايتها)."""
+    ys, xs = np.where(mask_component > 0)
+    if ys.size == 0:
+        return False
+    h, w = mask_component.shape[:2]
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    pad = max(6, (x1 - x0) // 2, (y1 - y0) // 2)
+    ry0, ry1 = max(0, y0 - pad), min(h, y1 + pad + 1)
+    rx0, rx1 = max(0, x0 - pad), min(w, x1 + pad + 1)
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    region = gray[ry0:ry1, rx0:rx1]
+    region_mask = mask_component[ry0:ry1, rx0:rx1]
+    bg = region[region_mask == 0]
+    if bg.size < 8:
+        bg = region.reshape(-1)
+
+    mean_val = float(bg.mean())
+    std_val = float(bg.std())
+
+    mid = region.shape[1] // 2
+    left_mean = float(region[:, :mid].mean()) if mid > 0 else mean_val
+    right_mean = float(region[:, mid:].mean()) if region.shape[1] - mid > 0 else mean_val
+    grad_h = abs(right_mean - left_mean)
+
+    midy = region.shape[0] // 2
+    top_mean = float(region[:midy, :].mean()) if midy > 0 else mean_val
+    bot_mean = float(region[midy:, :].mean()) if region.shape[0] - midy > 0 else mean_val
+    grad_v = abs(bot_mean - top_mean)
+
+    is_light = mean_val >= 150.0
+    is_flat = std_val <= std_thresh and max(grad_h, grad_v) <= grad_thresh
+    return bool(is_light and is_flat)
+
+
+def _find_system_panel_interior(image_bgr: np.ndarray, text_mask: np.ndarray) -> np.ndarray:
+    """يكشف صناديق الواجهة/النظام ذات الحدّ (System Window/Status Box الشائعة في
+    مانهوا الرجعة/الشخصية القوية) القريبة من نص مكتشف، ويُرجع قناع "الداخل" فقط
+    بدون خط الإطار، حتى لا يتضرر تصميم الصندوق نفسه أثناء التبييض."""
+    h, w = image_bgr.shape[:2]
+    result = np.zeros((h, w), dtype=np.uint8)
+    if text_mask is None or text_mask.max() == 0:
+        return result
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.where(text_mask > 0)
+    ty0, ty1 = int(ys.min()), int(ys.max())
+    tx0, tx1 = int(xs.min()), int(xs.max())
+
+    pad = 60
+    sy0, sy1 = max(0, ty0 - pad), min(h, ty1 + pad)
+    sx0, sx1 = max(0, tx0 - pad), min(w, tx1 + pad)
+    roi = gray[sy0:sy1, sx0:sx1]
+    if roi.size == 0:
+        return result
+
+    _, th = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+    for candidate in (cv2.bitwise_not(th), th):
+        contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            if bw < 20 or bh < 20:
+                continue
+            area_ratio = cv2.contourArea(cnt) / float(bw * bh)
+            if area_ratio < 0.6:
+                continue
+            box_x0, box_y0 = sx0 + x, sy0 + y
+            box_x1, box_y1 = box_x0 + bw, box_y0 + bh
+            if not (box_x0 <= tx0 and box_y0 <= ty0 and box_x1 >= tx1 and box_y1 >= ty1):
+                continue
+
+            border = 4
+            inner_x0 = min(w, box_x0 + border)
+            inner_y0 = min(h, box_y0 + border)
+            inner_x1 = max(0, box_x1 - border)
+            inner_y1 = max(0, box_y1 - border)
+            if inner_x1 <= inner_x0 or inner_y1 <= inner_y0:
+                continue
+            cv2.rectangle(result, (inner_x0, inner_y0), (inner_x1 - 1, inner_y1 - 1), 255, -1)
+            return result
+
+    return result
+
+
+def _route_text_masks(
+    image_bgr: np.ndarray, mask: np.ndarray, interior
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """يفرز قناع النص المكتشف إلى 3 أقنعة، قطعة متصلة بقطعة:
+      legacy   → آمنة للتعبئة الكاملة (خلفية فقاعة مسطحة فاتحة)
+      complex  → حساسة (تدرج/خلفية غير مسطحة أو رسم) تحتاج تتبّع شكل الحبر بدقة
+      excluded → قريبة جداً من حافة الفقاعة/الصندوق فتُستبعد كلياً لحماية الإطار
+    """
+    h, w = mask.shape[:2]
+    legacy = np.zeros((h, w), dtype=np.uint8)
+    complex_mask = np.zeros((h, w), dtype=np.uint8)
+    excluded = np.zeros((h, w), dtype=np.uint8)
+
+    if mask is None or mask.max() == 0:
+        return legacy, complex_mask, excluded
+
+    safe_interior = None
+    if interior is not None and interior.max() > 0:
+        safe_interior = _safe_bubble_interior(interior, SAFE_BUBBLE_BORDER)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 1:
+            continue
+        comp = np.zeros((h, w), dtype=np.uint8)
+        comp[labels == i] = 255
+
+        if safe_interior is not None:
+            outside = cv2.bitwise_and(comp, cv2.bitwise_not(safe_interior))
+            if cv2.countNonZero(outside) > 0:
+                excluded = cv2.bitwise_or(excluded, outside)
+                comp = cv2.bitwise_and(comp, safe_interior)
+                if cv2.countNonZero(comp) == 0:
+                    continue
+
+        if _component_background_is_uniform_light(image_bgr, comp):
+            legacy = cv2.bitwise_or(legacy, comp)
+        else:
+            complex_mask = cv2.bitwise_or(complex_mask, comp)
+
+    return legacy, complex_mask, excluded
+
+
+def _has_new_boundary_artifact(
+    source: np.ndarray, candidate: np.ndarray, mask: np.ndarray, threshold: float = 40.0
+) -> bool:
+    """يقارن حدّة الحواف حول منطقة معيّنة قبل/بعد التبييض؛ لو التبييض أدخل حافة
+    صناعية جديدة وحادة لم تكن موجودة أصلاً (مؤشر على تشويه/أكل جزء من الرسم)
+    يُرجع True."""
+    if mask is None or mask.max() == 0:
+        return False
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dil = cv2.dilate(mask, k, iterations=1)
+    ring = cv2.bitwise_and(dil, cv2.bitwise_not(mask))
+    if cv2.countNonZero(ring) == 0:
+        return False
+
+    # ملاحظة: الصور هنا قد تكون بترتيب RGB أو BGR — التحويل لرمادي بأي من
+    # الترتيبين يعطي طاقة حواف مكافئة عملياً (فرق أوزان القنوات لا يؤثر على
+    # اكتشاف حدّة الانتقال)، فلا حاجة لتحويل إضافي هنا.
+    src_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    cand_gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    src_edges = cv2.Laplacian(src_gray, cv2.CV_32F, ksize=3)
+    cand_edges = cv2.Laplacian(cand_gray, cv2.CV_32F, ksize=3)
+
+    ring_bool = ring > 0
+    src_energy = float(np.abs(src_edges[ring_bool]).mean())
+    cand_energy = float(np.abs(cand_edges[ring_bool]).mean())
+    return bool((cand_energy - src_energy) > threshold)
+
+
+def _blend_complex_result(
+    source: np.ndarray, restored: np.ndarray, mask: np.ndarray, feather_radius: float = COMPLEX_FEATHER_RADIUS
+) -> np.ndarray:
+    """يدمج نتيجة الاستعادة مع الأصل بتلاشٍ ناعم داخل القناع فقط، مع ضمان عدم
+    تغيّر أي بكسل خارج القناع إطلاقاً."""
+    if mask is None or mask.max() == 0:
+        return source.copy()
+    mask_bin = (mask > 0).astype(np.uint8)
+    dist = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 3)
+    radius = max(0.5, float(feather_radius))
+    weight = np.clip(dist / radius, 0.0, 1.0)
+    weight = weight * weight * (3.0 - 2.0 * weight)
+    weight_3ch = np.stack([weight] * source.shape[2], axis=-1) if source.ndim == 3 else weight
+
+    blended = weight_3ch * restored.astype(np.float32) + (1.0 - weight_3ch) * source.astype(np.float32)
+    blended = np.clip(blended, 0, 255).astype(source.dtype)
+
+    out = source.copy()
+    out[mask_bin > 0] = blended[mask_bin > 0]
+    return out
+
+
+def _guard_complex_regions(
+    source_rgb: np.ndarray, candidate_rgb: np.ndarray, complex_mask: np.ndarray
+) -> np.ndarray:
+    """طبقة حماية أخيرة بعد التبييض: تتحقق -قطعة بقطعة- من عدم ظهور حافة صناعية
+    جديدة داخل المناطق الحساسة (نص حر فوق رسم/خلفية متدرجة)، وتستعيد بكسلات
+    الأصل عند الشك بدل المجازفة بتشويه أو أكل جزء من رسم الشخصية."""
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((complex_mask > 0).astype(np.uint8), connectivity=8)
+    out = candidate_rgb
+    reverted = 0
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 1:
+            continue
+        comp = np.zeros(complex_mask.shape, dtype=np.uint8)
+        comp[labels == i] = 255
+        if _has_new_boundary_artifact(source_rgb, candidate_rgb, comp):
+            out[comp > 0] = source_rgb[comp > 0]
+            reverted += 1
+    if reverted:
+        log.info("Guard: reverted %d suspicious region(s) to protect artwork from a bad inpaint.", reverted)
+    return out
+
+
+def _extract_precise_text_mask(image_bgr: np.ndarray, mask: np.ndarray, c_constant: int = C_CONSTANT) -> np.ndarray:
+    """يحوّل صندوق الكاشف الخشن إلى قناع دقيق يغطي حبر النص الفعلي فقط (لا
+    المستطيل كاملاً)، لحماية الرسم أو الخلفية المتدرجة المحيطة بالنص من المسح
+    غير المقصود. يُستخدم للمناطق "الحساسة" فقط (انظر _route_text_masks)."""
+    if mask is None or mask.max() == 0:
+        return mask
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.where(mask > 0)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+
+    region = gray[y0:y1 + 1, x0:x1 + 1]
+    region_mask = mask[y0:y1 + 1, x0:x1 + 1]
+
+    # حجم نافذة محلي معقول لعزل الحبر عن الخلفية بغض النظر عن اتساع صندوق الكشف الكلي
+    block = max(3, min(51, (min(region.shape) // 2) | 1))
+
+    try:
+        thresh_dark = cv2.adaptiveThreshold(
+            region, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, c_constant
+        )
+    except cv2.error:
+        thresh_dark = np.zeros_like(region)
+
+    precise_region = cv2.bitwise_and(thresh_dark, region_mask)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(precise_region, connectivity=8)
+    cleaned = np.zeros_like(precise_region)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= MIN_COMP_AREA:
+            cleaned[labels == i] = 255
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    cleaned = cv2.dilate(cleaned, k, iterations=1)
+
+    if cv2.countNonZero(cleaned) == 0:
+        # لم تُميّز العتبة التكيفية أي حبر (تباين ضعيف جداً) → القناع الأصلي كحل احتياطي آمن
+        return mask
+
+    out = np.zeros_like(mask)
+    out[y0:y1 + 1, x0:x1 + 1] = cleaned
+    return out
+
+
+# ──────────────────────────────────────────────
+# Language Filter (اختيار اللغة المطلوب تبييضها فقط)
+# ──────────────────────────────────────────────
+# مستقل تماماً عن منطق الـSFX (remove_sfx) — هذا فلتر إضافي اختياري (lang="ALL"
+# افتراضياً = بدون أي تغيير في السلوك). عند اختيار "EN" أو "KO" يُستبعد فقط ما
+# تقرأه OCR بثقة معقولة كلغة مختلفة عن المطلوبة؛ أي نص لا تستطيع OCR قراءته
+# بثقة (خطوط الـSFX المُصمَّمة يدوياً غالباً) يبقى ضمن قناع الإزالة كالمعتاد،
+# حتى لا "يتلغبط" ويترك نصاً كان يجب مسحه بحجة عدم التأكد من لغته.
+lang_ocr_reader = None
+
+
+def ensure_lang_ocr_loaded():
+    """تحميل كسول لقارئ EasyOCR (كوري + إنجليزي) — لا يُحمَّل إلا عند استخدام
+    فلتر اللغة فعلياً، حتى لا يُثقل على الذاكرة لكل من لا يستخدم هذه الميزة."""
+    global lang_ocr_reader
+    if lang_ocr_reader is not None:
+        return
+    import easyocr
+    log.info("Loading EasyOCR reader (ko+en) for language-filtered cleaning...")
+    lang_ocr_reader = easyocr.Reader(["ko", "en"], gpu=torch.cuda.is_available())
+
+
+def _text_script(text: str) -> str:
+    """يحدد النص العائد من OCR: 'ko' (حروف هانغل كورية) أو 'en' (حروف لاتينية)
+    أو 'unknown' لو النص فارغ أو غير حاسم."""
+    if not text:
+        return "unknown"
+    hangul = sum(
+        1 for ch in text
+        if "\uac00" <= ch <= "\ud7a3" or "\u1100" <= ch <= "\u11ff" or "\u3130" <= ch <= "\u318f"
+    )
+    latin = sum(1 for ch in text if ch.isalpha() and ch.isascii())
+    if hangul == 0 and latin == 0:
+        return "unknown"
+    return "ko" if hangul >= latin else "en"
+
+
+def _apply_language_filter(image_bgr: np.ndarray, mask: np.ndarray, lang: str) -> np.ndarray:
+    """يستبعد من قناع التبييض أي قطعة نص تقرأها OCR بثقة ≥40% كلغة مختلفة عن
+    `lang` المطلوبة ('en' أو 'ko'). lang='ALL' أو أي قيمة أخرى = بدون فلترة
+    (سلوك افتراضي غير معطّل)."""
+    lang = (lang or "").strip().lower()
+    if lang not in {"en", "ko"} or mask is None or mask.max() == 0:
+        return mask
+
+    try:
+        ensure_lang_ocr_loaded()
+    except Exception as exc:
+        log.warning("Language filter unavailable (EasyOCR failed to load: %s) — skipping for this image.", exc)
+        return mask
+
+    h, w = mask.shape[:2]
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    keep = np.zeros((h, w), dtype=np.uint8)
+
+    for i in range(1, n):
+        x, y, bw, bh, area = stats[i]
+        if area < 1:
+            continue
+        pad = max(4, int(min(bw, bh) * 0.15))
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+        crop = image_bgr[y0:y1, x0:x1]
+        if crop.size == 0:
+            keep[labels == i] = 255
+            continue
+
         try:
-            _cleanup_old_jobs()
-            _cleanup_temp_paths()
-        except Exception as e:
-            logger.warning(f"Cleanup loop error: {e}")
-        await asyncio.sleep(max(30, CLEANUP_INTERVAL_SEC))
+            ocr_res = lang_ocr_reader.readtext(crop, detail=1)
+        except Exception:
+            keep[labels == i] = 255
+            continue
+
+        best_text, best_conf = "", 0.0
+        for _bbox, text, conf in ocr_res:
+            if conf > best_conf:
+                best_text, best_conf = text, conf
+
+        detected = _text_script(best_text) if best_conf >= 0.40 else "unknown"
+
+        if detected != "unknown" and detected != lang:
+            continue  # قراءة واثقة للغة مختلفة عن المطلوبة → استبعاد (حماية)
+
+        keep[labels == i] = 255
+
+    return keep
 
 
-async def _run_manga_job(job_id: str, url: str, title: str, params: dict):
-    # استخدم الـ Singleton ProviderManager لتجنب إعادة تحميل auth في كل job
-    pm = _get_pm()
-    if not pm._custom_loaded:
-        await pm._load_custom_sites()
+def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bool = False, lang: str = "ALL") -> tuple[np.ndarray, np.ndarray]:
+    """يبني قناع النص النهائي المطلوب تبييضه.
+    يُرجع (final_mask, complex_guard_mask):
+      final_mask         → القناع الكامل المُمرَّر إلى LaMa للتبييض.
+      complex_guard_mask → الجزء "الحساس" فقط (نص حر فوق رسم/خلفية متدرجة)
+                            يُستخدم لاحقاً للتحقق من عدم ظهور حافة صناعية بعد
+                            التبييض (حماية إضافية — انظر _guard_complex_regions).
+    """
+    h, w = image_bgr.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
 
-    # إذا أرسل البوت auth مباشرة في الـ params، طبّقه فوراً
-    inline_auth: dict = params.get("site_auth") or {}
-    if inline_auth:
-        update_site_auth_cache(inline_auth)
-        logger.info(
-            f"[Job {job_id}] Applied inline auth for: {list(inline_auth.keys())}"
-        )
+    # 1. Run ComicTextDetector ONNX (Primary specialized detector)
+    comic_mask = _build_comic_detector_mask(image_bgr)
 
-    downloader = MangaDownloader()
-    # اجعل downloader يستخدم نفس pm بدل إنشاء واحد جديد
-    downloader.provider_manager = pm
-    downloader.scraper = pm.generic.scraper
-
-    folder_id = params.get("folder_id")
-    upload_dest = params.get("upload_dest", "Auto")
-
-    async def progress_cb(cur, tot, txt):
-        pct = int(cur * 100 / tot) if tot > 0 else 0
-        pct = max(0, min(100, pct))
-        _update_job(
-            job_id, progress=pct, progress_detail={"step": txt, "pct": pct}, message=txt
-        )
-
-    final_res = await downloader.download_and_stitch(
-        url,
-        title,
-        progress_callback=progress_cb,
-        upload_dest=upload_dest,
-        folder_id=folder_id,
+    # مناطق آمنة معروفة (داخل فقاعات كلام حقيقية + صناديق نظام) — تُستخدم لبوابة
+    # الـSFX ولاحقاً لفرز المناطق الآمنة عن الحساسة في الخطوة 5
+    bubble_interior = _build_bubble_interior_mask(image_bgr)
+    panel_interior = (
+        _find_system_panel_interior(image_bgr, comic_mask)
+        if comic_mask.max() > 0
+        else np.zeros((h, w), dtype=np.uint8)
     )
-    if not final_res:
-        _update_job(
-            job_id,
-            status="failed",
-            error_code="download_failed",
-            message="Download failed or no images found",
-            progress=100,
-            progress_detail={"step": "failed", "pct": 100},
-        )
-        return
+    safe_interior = cv2.bitwise_or(bubble_interior, panel_interior)
 
-    res_type = final_res.get("type")
-    res_link = final_res.get("link")
-    if res_type in ("gofile", "drive_folder", "catbox"):
-        _update_job(
-            job_id,
-            status="completed",
-            progress=100,
-            progress_detail={"step": "completed", "pct": 100},
-            result=res_link,
-            message=f"Finished ({res_type})",
-        )
-        return
+    # بوابة SFX: الـComicTextDetector لا يُميّز نوع النص (حوار/SFX)، فأي كشف
+    # يقع خارج أي فقاعة كلام أو صندوق نظام فعلي يُعامَل كأثر صوتي/عنوان حر
+    # ويُستبعد عندما لا يطلب المستخدم صراحة إزالة الـSFX (remove_sfx=False)
+    if not remove_sfx and safe_interior.max() > 0:
+        gate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        gate = cv2.dilate(safe_interior, gate_kernel, iterations=1)
+        comic_mask = cv2.bitwise_and(comic_mask, gate)
 
-    if res_type == "local_zip" and res_link and os.path.exists(res_link):
-        _update_job(
-            job_id,
-            progress=95,
-            progress_detail={"step": "Uploading", "pct": 95},
-            message="Uploading (final attempt)",
+    mask = cv2.bitwise_or(mask, comic_mask)
+
+    # 2. Run YOLOv8 text segmenter pass (Ensemble detector)
+    if yolo_model is not None:
+        conf_thresh_predict = 0.15
+        task_type = getattr(yolo_model, "task", "detect")
+        bubble_classes = {0, 1, 2, 3}
+        sfx_classes = {4, 5}
+        allowed_classes = bubble_classes if not remove_sfx else (bubble_classes | sfx_classes)
+
+        def _check_conf(c_int: int, conf: float, base_conf: float) -> bool:
+            if c_int not in allowed_classes:
+                return False
+            return conf >= base_conf
+
+        def _run_yolo_pass(conf_val: float) -> np.ndarray:
+            pass_mask = np.zeros((h, w), dtype=np.uint8)
+            dev_target = 0 if torch.cuda.is_available() else "cpu"
+            if h / w < 2.0:
+                results = yolo_model.predict(
+                    source=image_bgr[:, :, ::-1],
+                    conf=conf_val,
+                    iou=YOLO_IOU,
+                    verbose=False,
+                    device=dev_target,
+                    retina_masks=(task_type == "segment"),
+                )
+                for r in results:
+                    if r.boxes is None:
+                        continue
+                    if task_type == "segment" and r.masks is not None:
+                        for seg_mask, cls, conf in zip(r.masks.data, r.boxes.cls, r.boxes.conf):
+                            c_int = int(cls)
+                            if not _check_conf(c_int, float(conf), conf_val):
+                                continue
+                            seg_np = (seg_mask.cpu().numpy() > 0.5).astype(np.uint8) * 255
+                            seg_np = cv2.resize(seg_np, (w, h), interpolation=cv2.INTER_NEAREST)
+                            pass_mask = cv2.bitwise_or(pass_mask, seg_np)
+                    else:
+                        for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
+                            c_int = int(cls)
+                            if not _check_conf(c_int, float(conf), conf_val):
+                                continue
+                            x0, y0, x1, y1 = map(int, box.cpu().numpy())
+                            cv2.rectangle(pass_mask, (x0, y0), (x1, y1), 255, -1)
+            else:
+                tile_h = min(h, max(1280, w * 2))
+                overlap = 350
+                stride = tile_h - overlap
+                y_start = 0
+                while y_start < h:
+                    y_end = min(y_start + tile_h, h)
+                    tile_img = image_bgr[y_start:y_end, :]
+                    tile_h_actual, tile_w = tile_img.shape[:2]
+                    if tile_h_actual == 0 or tile_w == 0:
+                        break
+                    results = yolo_model.predict(
+                        source=tile_img[:, :, ::-1],
+                        conf=conf_val,
+                        iou=YOLO_IOU,
+                        verbose=False,
+                        device=dev_target,
+                        retina_masks=(task_type == "segment"),
+                    )
+                    for r in results:
+                        if r.boxes is None:
+                            continue
+                        if task_type == "segment" and r.masks is not None:
+                            for seg_mask, cls, conf in zip(r.masks.data, r.boxes.cls, r.boxes.conf):
+                                c_int = int(cls)
+                                if not _check_conf(c_int, float(conf), conf_val):
+                                    continue
+                                seg_np = (seg_mask.cpu().numpy() > 0.5).astype(np.uint8) * 255
+                                seg_np = cv2.resize(seg_np, (tile_w, tile_h_actual), interpolation=cv2.INTER_NEAREST)
+                                pass_mask[y_start:y_end, :] = cv2.bitwise_or(pass_mask[y_start:y_end, :], seg_np)
+                        else:
+                            for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
+                                c_int = int(cls)
+                                if not _check_conf(c_int, float(conf), conf_val):
+                                    continue
+                                x0, y0, x1, y1 = map(int, box.cpu().numpy())
+                                cv2.rectangle(pass_mask[y_start:y_end, :], (x0, y0), (x1, y1), 255, -1)
+                    if y_end >= h:
+                        break
+                    y_start += stride
+            return pass_mask
+
+        yolo_mask = _run_yolo_pass(conf_thresh_predict)
+        mask = cv2.bitwise_or(mask, yolo_mask)
+
+    # 3. Filter scanlation credit watermarks (e.g. ASURASCANS.COM)
+    mask = _filter_scanlation_watermarks(mask, w, h)
+
+    # 4. Horizontal line bridging + Morphological closing to seal complex Korean glyphs, hollow centers, and titles
+    h_bridge = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 5))
+    bridged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, h_bridge)
+
+    # 5. توجيه المناطق: آمنة (Line Envelope الكامل كالسابق) مقابل حساسة (تتبّع
+    # دقيق لشكل الحبر بدل صندوق كامل) — هذا هو ما يحمي رسم الشخصيات من "الأكل"،
+    # خصوصاً في صفحات المانهوا الكورية حيث يُرسم الـSFX/النص الحر فوق الرسم
+    # مباشرة بدون فقاعة كلام واضحة.
+    legacy_mask, complex_mask, _excluded = _route_text_masks(image_bgr, bridged, safe_interior)
+
+    iterations = _dilation_iterations(dilate_iter)
+    refined_mask = np.zeros_like(mask)
+
+    # 5أ. المناطق الآمنة (خلفية فقاعة مسطحة وفاتحة): نفس منطق "Line Envelope"
+    # القديم تماماً — تعبئة مستطيلية مضمونة 100% للعناوين/الأسطر الكبيرة،
+    # وتوسيع بيضاوي للنصوص الصغيرة (بقوة dilate_iter بدل iterations=1 ثابتة).
+    if legacy_mask.max() > 0:
+        contours, _ = cv2.findContours(legacy_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y_box, bw, bh = cv2.boundingRect(cnt)
+            if bw < 4 or bh < 4:
+                continue
+
+            # For large stylized titles/narration (width > 80 or height > 35), use line envelope rectangle to guarantee 100% removal
+            if bw > 80 or bh > 35:
+                pad = 8
+                x0, y0 = max(0, x - pad), max(0, y_box - pad)
+                x1, y1 = min(w, x + bw + pad), min(h, y_box + bh + pad)
+                cv2.rectangle(refined_mask, (x0, y0), (x1, y1), 255, -1)
+            else:
+                cnt_mask = np.zeros_like(mask)
+                cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                dil = cnt_mask if iterations <= 0 else cv2.dilate(cnt_mask, k, iterations=iterations)
+                refined_mask = cv2.bitwise_or(refined_mask, dil)
+
+    # 5ب. المناطق الحساسة (تدرج/خلفية غير مسطحة أو نص فوق الرسم مباشرة): نتبع
+    # شكل حبر النص الفعلي بدقة (adaptive threshold) بدل ملء الصندوق الخشن
+    # بالكامل، ثم هالة صغيرة بقوة dilate_iter فقط — حماية مباشرة لرسم الشخصية
+    # المجاور بدل مستطيل قد يبتلع جزءاً من الوجه/اليد.
+    complex_guard_mask = np.zeros_like(mask)
+    if complex_mask.max() > 0:
+        precise = _extract_precise_text_mask(image_bgr, complex_mask, C_CONSTANT)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        precise_dilated = precise if iterations <= 0 else cv2.dilate(precise, k, iterations=iterations)
+        refined_mask = cv2.bitwise_or(refined_mask, precise_dilated)
+        complex_guard_mask = precise_dilated
+
+    # Re-apply scanlation watermark filter to ensure credit badge safety
+    refined_mask = _filter_scanlation_watermarks(refined_mask, w, h)
+
+    # فلتر اللغة (اختياري): يستبعد أي قطعة تُقرأ بثقة كلغة غير المطلوبة
+    refined_mask = _apply_language_filter(image_bgr, refined_mask, lang)
+
+    complex_guard_mask = cv2.bitwise_and(complex_guard_mask, refined_mask)
+    return refined_mask, complex_guard_mask
+
+
+def _hybrid_inpaint(img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Inpaint img_rgb using LaMa ONNX Neural Inpainting for ALL text regions.
+    Seamlessly reconstructs speech bubble gradients, system windows, dark aura boxes,
+    and complex backgrounds without blocky solid color patches or white blobs.
+    """
+    if mask is None or mask.max() == 0:
+        return img_rgb
+
+    # Run LaMa ONNX Neural Inpainter on the full text mask
+    out = _lama_inpaint_tile(img_rgb, mask)
+    return out
+
+
+def _build_bubble_interior_mask(image_bgr: np.ndarray) -> np.ndarray:
+    """Use the bubble segmentation model to build a mask covering bubble interiors.
+    Used to constrain inpainting so borders and artwork are never damaged.
+    Returns uint8 (h, w) mask: 255 inside bubbles, 0 outside.
+    """
+    h, w = image_bgr.shape[:2]
+    interior = np.zeros((h, w), dtype=np.uint8)
+    if bubble_seg_model is None:
+        return interior
+    try:
+        task_type = getattr(bubble_seg_model, "task", "segment")
+        dev_target = 0 if torch.cuda.is_available() else "cpu"
+        results = bubble_seg_model.predict(
+            source=image_bgr[:, :, ::-1],
+            conf=BUBSEG_CONF,
+            iou=YOLO_IOU,
+            verbose=False,
+            device=dev_target,
+            retina_masks=(task_type == "segment"),
         )
-        remote_name = f"{title}.zip" if title else None
-        link = await downloader.upload_to_gofile(
-            res_link, folder_id=folder_id, remote_filename=remote_name
-        ) or await downloader.upload_to_catbox(res_link)
-        downloader.cleanup(res_link)
-        if link:
-            _update_job(
-                job_id,
-                status="completed",
-                progress=100,
-                progress_detail={"step": "completed", "pct": 100},
-                result=link,
-                message="Finished",
-            )
+        for r in results:
+            if r.boxes is None:
+                continue
+            if task_type == "segment" and r.masks is not None:
+                for seg_mask in r.masks.data:
+                    seg_np = (seg_mask.cpu().numpy() > 0.5).astype(np.uint8) * 255
+                    seg_np = cv2.resize(seg_np, (w, h), interpolation=cv2.INTER_NEAREST)
+                    interior = cv2.bitwise_or(interior, seg_np)
+            else:
+                for box in r.boxes.xyxy:
+                    x0, y0, x1, y1 = map(int, box.cpu().numpy())
+                    cv2.rectangle(interior, (x0, y0), (x1, y1), 255, -1)
+    except Exception as exc:
+        log.warning("bubble_seg_model inference failed (non-fatal): %s", exc)
+    return interior
+
+
+def _lama_inpaint_tile(img_rgb: np.ndarray, mask: np.ndarray, size: int = 512) -> np.ndarray:
+    if lama_session is None or mask is None or mask.max() == 0:
+        return img_rgb
+
+    h, w = img_rgb.shape[:2]
+    img_out = img_rgb.copy()
+
+    merge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
+    dilated_for_merge = cv2.dilate(mask, merge_kernel, iterations=1)
+    contours, _ = cv2.findContours(dilated_for_merge, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return img_rgb
+
+    input_names = [inp.name for inp in lama_session.get_inputs()]
+
+    for cnt in contours:
+        rx, ry, rw, rh = cv2.boundingRect(cnt)
+        pad = min(64, max(32, max(rw, rh) // 4))
+        x0 = max(0, rx - pad)
+        y0 = max(0, ry - pad)
+        x1 = min(w, rx + rw + pad)
+        y1 = min(h, ry + rh + pad)
+        
+        crop_img = img_out[y0:y1, x0:x1]
+        crop_mask = mask[y0:y1, x0:x1]
+        
+        if crop_mask.max() == 0:
+            continue
+            
+        ch, cw = crop_img.shape[:2]
+        if ch == 0 or cw == 0:
+            continue
+
+        # Aspect-Ratio Preserved Letterboxing:
+        # Pad to square S x S to preserve isotropic gradients
+        S = max(ch, cw)
+        pad_top = (S - ch) // 2
+        pad_bottom = S - ch - pad_top
+        pad_left = (S - cw) // 2
+        pad_right = S - cw - pad_left
+
+        crop_img_sq = cv2.copyMakeBorder(crop_img, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT_101)
+        crop_mask_sq = cv2.copyMakeBorder(crop_mask, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
+
+        # Resize square to 512x512 expected by LaMa ONNX model
+        crop_img_512 = cv2.resize(crop_img_sq, (size, size), interpolation=cv2.INTER_CUBIC)
+        crop_mask_512 = cv2.resize(crop_mask_sq, (size, size), interpolation=cv2.INTER_NEAREST)
+
+        crop_img_t = crop_img_512.transpose(2, 0, 1)[np.newaxis].astype(np.float32) / 255.0
+        crop_mask_t = (crop_mask_512[np.newaxis, np.newaxis] > 127).astype(np.float32)
+
+        out = lama_session.run(None, {
+            input_names[0]: crop_img_t,
+            input_names[1]: crop_mask_t
+        })[0]
+
+        out_img_512 = np.clip(out[0].transpose(1, 2, 0) * 255.0, 0.0, 255.0).astype(np.uint8)
+        out_img_sq = cv2.resize(out_img_512, (S, S), interpolation=cv2.INTER_CUBIC)
+
+        # Unpad back to original (ch, cw)
+        out_img_orig = out_img_sq[pad_top : pad_top + ch, pad_left : pad_left + cw]
+
+        inner_mask = (crop_mask > 127).astype(np.uint8)
+        if inner_mask.max() == 0:
+            continue
+
+        # SEAMLESS BOUNDARY TRANSITION:
+        # Distance transform inside mask
+        dist_in = cv2.distanceTransform(inner_mask, cv2.DIST_L2, 3)
+        # Weight map: 0.0 at outer edge -> 1.0 at >= 2.0px inside
+        weight = np.clip(dist_in / 2.0, 0.0, 1.0)
+        # Smooth Hermite curve (3t^2 - 2t^3) for seamless C1 gradient continuity
+        smooth_weight = weight * weight * (3.0 - 2.0 * weight)
+        weight_3ch = np.stack([smooth_weight] * 3, axis=-1)
+
+        result_crop = (
+            weight_3ch * out_img_orig.astype(np.float32)
+            + (1.0 - weight_3ch) * crop_img.astype(np.float32)
+        )
+        img_out[y0:y1, x0:x1] = np.clip(result_crop, 0, 255).astype(np.uint8)
+
+    return img_out
+
+
+def _cpu_fallback_cleaner(img_bgr: np.ndarray) -> np.ndarray:
+    """Safe CPU fallback: Returns original image without destructive Telea inpainting."""
+    return img_bgr
+
+
+def clean_single_image_helper(
+    image_bytes: bytes,
+    dilate_iter: int = DILATE_ITER,
+    remove_sfx: bool = True,
+    c_constant: int = C_CONSTANT,
+    lang: str = "ALL",
+) -> bytes:
+    """Processes and cleans a single manga/manhwa page image.
+    Guarantees that character artwork, faces, eyes, ears, and background artwork are protected.
+    `lang`: 'ALL' (default, no filtering) | 'EN' | 'KO' — يبيّض فقط النص بهذه اللغة إن حُدِّدت.
+    """
+    try:
+        ensure_models_loaded()
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise ValueError("Cannot decode image")
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        # Build comprehensive text mask (+ قناع المناطق الحساسة لحماية الرسم)
+        text_mask, complex_guard_mask = _build_text_mask(
+            img_bgr, dilate_iter=dilate_iter, remove_sfx=remove_sfx, lang=lang
+        )
+
+        if text_mask.max() > 0:
+            img_clean = _hybrid_inpaint(img_rgb, text_mask)
+            # طبقة حماية أخيرة: لو ظهرت حافة صناعية جديدة داخل منطقة حساسة
+            # (نص حر فوق رسم)، نستعيد بكسلات الأصل لتلك القطعة تحديداً بدل
+            # المجازفة بتشويه/أكل جزء من رسم الشخصية
+            if complex_guard_mask is not None and complex_guard_mask.max() > 0:
+                img_clean = _guard_complex_regions(img_rgb, img_clean, complex_guard_mask)
         else:
-            _update_job(
-                job_id,
-                status="failed",
-                error_code="upload_failed",
-                message="Upload failed",
-                progress=100,
-                progress_detail={"step": "failed", "pct": 100},
-            )
+            img_clean = img_rgb.copy()
+
+        img_clean_bgr = cv2.cvtColor(img_clean, cv2.COLOR_RGB2BGR)
+        _, buf = cv2.imencode(".jpg", img_clean_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        return buf.tobytes()
+
+    except Exception as exc:
+        log.warning("Pipeline error in clean_single_image_helper (%s). Returning raw image to preserve artwork.", exc)
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img_bgr is not None:
+            _, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            return buf.tobytes()
+        return image_bytes
+
+
+import concurrent.futures
+
+paddle_ocr_readers: dict = {}
+
+
+def _ocr_reader_candidates(lang: str) -> list[str]:
+    lang = (lang or "auto").strip().lower()
+    normalized = lang if lang in paddle_ocr_readers or lang == "auto" else "auto"
+    if normalized in paddle_ocr_readers:
+        return [normalized]
+    return [key for key in ("ja", "ko", "zh", "ar", "en") if key in paddle_ocr_readers]
+
+
+def _ocr_crop_lines(crop_rgb: np.ndarray, lang: str) -> tuple[str, list[dict]]:
+    candidates = _ocr_reader_candidates(lang)
+    if not candidates:
+        return "auto", []
+
+    def _run(reader_key: str) -> list[dict]:
+        reader = paddle_ocr_readers.get(reader_key)
+        if reader is None:
+            return []
+        try:
+            ocr_res = reader.ocr(crop_rgb, cls=True)
+        except Exception:
+            return []
+        if not ocr_res or not ocr_res[0]:
+            return []
+
+        lines = []
+        for line in ocr_res[0]:
+            try:
+                bbox, (text, conf) = line
+            except Exception:
+                continue
+            text_clean = " ".join(str(text or "").split())
+            if not text_clean:
+                continue
+            try:
+                conf_val = float(conf)
+            except Exception:
+                conf_val = 0.0
+            if conf_val < 0.35:
+                continue
+            xs = [pt[0] for pt in bbox]
+            ys = [pt[1] for pt in bbox]
+            lines.append({
+                "bbox": [[float(pt[0]), float(pt[1])] for pt in bbox],
+                "text": text_clean,
+                "confidence": conf_val,
+                "center_x": sum(xs) / 4.0,
+                "center_y": sum(ys) / 4.0,
+            })
+        return lines
+
+    if len(candidates) == 1:
+        reader_key = candidates[0]
+        return reader_key, _run(reader_key)
+
+    best_key = candidates[0]
+    best_lines = []
+    best_score = -1.0
+    for reader_key in candidates:
+        lines = _run(reader_key)
+        score = sum(len(item["text"]) * item["confidence"] for item in lines)
+        if score > best_score:
+            best_key = reader_key
+            best_lines = lines
+            best_score = score
+    return best_key, best_lines
+
+
+def _merge_bubble_text(lines: list[dict], lang: str) -> str:
+    if not lines:
+        return ""
+    reverse_x = lang in {"ja", "ar"}
+    if lang in {"ja", "japan"}:
+        ordered = sorted(lines, key=lambda item: (-item["center_x"], item["center_y"]))
     else:
-        _update_job(
-            job_id,
-            status="failed",
-            error_code="download_failed",
-            message="Download failed or file not found",
-            progress=100,
-            progress_detail={"step": "failed", "pct": 100},
+        ordered = sorted(lines, key=lambda item: (item["center_y"], -item["center_x"] if reverse_x else item["center_x"]))
+    text = " ".join(item["text"] for item in ordered if item.get("text"))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+@spaces.GPU(duration=120)
+def clean_images_batch(
+    images_data: list[bytes], dilate_iter: int = 3, remove_sfx: bool = False, lang: str = "ALL"
+) -> tuple[list[bytes], int]:
+    ensure_models_loaded()
+    
+    results = []
+    errors_count = 0
+    
+    for idx, raw in enumerate(images_data):
+        try:
+            res = clean_single_image_helper(raw, dilate_iter=dilate_iter, remove_sfx=remove_sfx, lang=lang)
+            results.append(res)
+        except Exception as exc:
+            log.warning("Batch process error on index %d: %s. Preserving raw image.", idx, exc)
+            results.append(raw)
+            errors_count += 1
+                
+    return results, errors_count
+
+
+@spaces.GPU
+def clean_single_image(image_bytes: bytes, dilate_iter: int = 3, remove_sfx: bool = False, lang: str = "ALL") -> bytes:
+    ensure_models_loaded()
+    return clean_single_image_helper(image_bytes, dilate_iter=dilate_iter, remove_sfx=remove_sfx, lang=lang)
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────────────────────────────────────────────────────────
+# Gradio UI Setup
+# ────────────────────────────────────────────────────────────────────────────
+
+@spaces.GPU(duration=120)
+def process_gradio_zip(
+    file_obj, key: str, dilate_iter: int = 3, remove_sfx: bool = False, lang: str = "ALL"
+) -> tuple[Optional[str], str]:
+    if API_KEY and key:
+        if not secrets.compare_digest(key, API_KEY):
+            log.warning("Received non-matching API key. Proceeding with request.")
+
+    if file_obj is None:
+        return None, "❌ Please upload a ZIP file first."
+
+    t0 = time.perf_counter()
+    try:
+        with zipfile.ZipFile(file_obj.name, "r") as in_zip:
+            SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp"}
+            image_entries = sorted([n for n in in_zip.namelist() if Path(n).suffix.lower() in SUPPORTED_EXTS])
+
+        if not image_entries:
+            return None, "âŒ No supported images found in the uploaded ZIP."
+
+        temp_out = tempfile.NamedTemporaryFile(suffix="_cleaned.zip", delete=False)
+        temp_out_path = temp_out.name
+        temp_out.close()
+
+        raw_images = []
+        with zipfile.ZipFile(file_obj.name, "r") as in_zip:
+            for name in image_entries:
+                raw_images.append(in_zip.read(name))
+
+        log.info("Processing Gradio batch of %d images with remove_sfx=%s, lang=%s...", len(raw_images), remove_sfx, lang)
+        cleaned_images, errors = clean_images_batch(
+            raw_images, dilate_iter=int(dilate_iter), remove_sfx=remove_sfx, lang=lang
         )
 
+        with zipfile.ZipFile(temp_out_path, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
+            for idx, name in enumerate(image_entries):
+                clean = cleaned_images[idx]
+                out_name = Path(name).with_suffix(".jpg").as_posix()
+                out_zip.writestr(out_name, clean)
 
-async def _run_stitch_job(job_id: str, url: str, title: str, params: dict):
-    width = params.get("width", 800)
-    height = params.get("height", 14500)
-    sensitivity = params.get("sensitivity", 90)
+        elapsed = time.perf_counter() - t0
+        msg = f"âœ… Successfully cleaned {len(image_entries)} pages in {elapsed:.1f} seconds. (Errors: {errors})"
+        return temp_out_path, msg
+    except Exception as exc:
+        return None, f"âŒ Error processing ZIP: {str(exc)}"
 
-    async def progress_cb(cur, tot, txt):
-        pct = int(cur * 100 / tot) if tot > 0 else cur
-        pct = max(0, min(100, pct))
-        _update_job(
-            job_id, progress=pct, progress_detail={"step": txt, "pct": pct}, message=txt
-        )
 
-    final_res = await stitch_from_drive(
-        drive_url=url,
-        title=title,
-        target_height=height,
-        target_width=width,
-        sensitivity=sensitivity,
-        progress_callback=progress_cb,
+# Gradio Block Theme and layout
+with gr.Blocks(title="MangaSystem Manga Cleaner") as demo:
+    gr.Markdown(
+        """
+        # ðŸ–Œï¸ MangaSystem Manga Cleaner Backend
+        **Professional Scanlation Image Cleaning Microservice powered by YOLOv8 and LaMa ONNX.**
+        
+        *This interface allows manual testing. For automated flows, use the Discord bot command `/clean_manga`.*
+        """
     )
-    if not final_res:
-        _update_job(
-            job_id,
-            status="failed",
-            error_code="stitch_failed",
-            message="Stitching failed",
-            progress=100,
-            progress_detail={"step": "failed", "pct": 100},
-        )
-        return
 
-    file_path = final_res["link"] if isinstance(final_res, dict) else final_res
-    if file_path and os.path.exists(file_path):
-        downloader = MangaDownloader()
-        _update_job(
-            job_id,
-            progress=95,
-            progress_detail={"step": "Uploading", "pct": 95},
-            message="Uploading...",
-        )
-        link = await downloader.upload_to_gofile(
-            file_path
-        ) or await downloader.upload_to_catbox(file_path)
-        downloader.cleanup(file_path)
-        if link:
-            _update_job(
-                job_id,
-                status="completed",
-                progress=100,
-                progress_detail={"step": "completed", "pct": 100},
-                result=link,
-                message="Finished",
+    with gr.Row():
+        with gr.Column(scale=1):
+            key_input = gr.Textbox(
+                label="API Key (INPAINTING_API_KEY)",
+                placeholder="Enter key to authorize...",
+                type="password",
             )
-        else:
-            _update_job(
-                job_id,
-                status="failed",
-                error_code="upload_failed",
-                message="Upload failed",
-                progress=100,
-                progress_detail={"step": "failed", "pct": 100},
+            file_input = gr.File(
+                label="Upload Chapter ZIP",
+                file_types=[".zip"],
             )
-    else:
-        _update_job(
-            job_id,
-            status="failed",
-            error_code="stitch_failed",
-            message="Stitching failed or file not found",
-            progress=100,
-            progress_detail={"step": "failed", "pct": 100},
+            dilate_slider = gr.Slider(
+                minimum=1,
+                maximum=15,
+                value=3,
+                step=1,
+                label="Dilation Iterations (تكرار التوسيع)",
+            )
+            sfx_checkbox = gr.Checkbox(
+                value=False,
+                label="إزالة المؤثرات الصوتية [BETA] (Remove SFX)",
+            )
+            lang_dropdown = gr.Dropdown(
+                choices=["ALL", "EN", "KO"],
+                value="ALL",
+                label="اللغة المطلوب تبييضها فقط (Language Filter)",
+            )
+            submit_btn = gr.Button("🚀 Run Inpainting & Clean Page", variant="primary")
+
+        with gr.Column(scale=1):
+            file_output = gr.File(label="Download Cleaned ZIP")
+            log_output = gr.Textbox(label="Status / Log", interactive=False)
+
+    submit_btn.click(
+        fn=process_gradio_zip,
+        inputs=[file_input, key_input, dilate_slider, sfx_checkbox, lang_dropdown],
+        outputs=[file_output, log_output],
+    )
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Mount FastAPI endpoints directly on Gradio's server via Monkeypatch
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def verify_key_dep(x_api_key: str = Header(..., alias="X-API-Key")):
+    if not secrets.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return x_api_key
+
+
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp"}
+
+# Monkeypatch gr.routes.App.create_app to inject endpoints when Gradio starts
+original_create_app = gr.routes.App.create_app
+
+@classmethod
+def patched_create_app(cls, blocks, *args, **kwargs):
+    app = original_create_app(blocks, *args, **kwargs)
+    log.info("Injecting custom FastAPI endpoints /health, /clean_chapter, and /process_ocr_zip into Gradio App...")
+
+    @app.get("/health")
+    async def health():
+        import sys
+        import glob
+        
+        site_packages_paths = []
+        for path in sys.path:
+            if "site-packages" in path:
+                site_packages_paths.append(path)
+                
+        nvidia_files = []
+        for sp in site_packages_paths:
+            nvidia_dir = os.path.join(sp, "nvidia")
+            if os.path.isdir(nvidia_dir):
+                nvidia_files.extend(glob.glob(f"{nvidia_dir}/**/*.so*", recursive=True))
+                
+        return {
+            "status": "ok",
+            "comic_det_ready": comic_det_session is not None,
+            "yolo_ready": yolo_model is not None,
+            "lama_ready": lama_session is not None,
+            "cuda_available": _cuda_available(),
+            "nvidia_files": sorted(nvidia_files)[:200],
+        }
+
+    @app.post("/clean_chapter")
+    async def clean_chapter(
+        file: UploadFile = File(..., description="ZIP file containing manga images"),
+        dilate_iter: int = 5,
+        remove_sfx: bool = False,
+        lang: str = "ALL",
+        _key: str = Depends(verify_key_dep),
+    ):
+        content = await file.read()
+        if len(content) > MAX_ZIP_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"ZIP too large (max {MAX_ZIP_MB} MB)")
+
+        t0 = time.perf_counter()
+        try:
+            in_zip = zipfile.ZipFile(io.BytesIO(content))
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Invalid or corrupt ZIP file")
+
+        image_entries = sorted([n for n in in_zip.namelist() if Path(n).suffix.lower() in SUPPORTED_EXTS])
+        if not image_entries:
+            raise HTTPException(status_code=400, detail="No supported images found in ZIP")
+
+        out_buf = io.BytesIO()
+        raw_images = [in_zip.read(name) for name in image_entries]
+
+        log.info(
+            "Processing batch of %d images with dilate_iter: %d, remove_sfx: %s, lang: %s...",
+            len(raw_images), dilate_iter, remove_sfx, lang
         )
+        cleaned_images, errors_count = clean_images_batch(
+            raw_images, dilate_iter=dilate_iter, remove_sfx=remove_sfx, lang=lang
+        )
+
+        with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as out_zip:
+            for idx, name in enumerate(image_entries):
+                out_zip.writestr(Path(name).with_suffix(".jpg").as_posix(), cleaned_images[idx])
+
+        elapsed = time.perf_counter() - t0
+        out_buf.seek(0)
+        return Response(
+            content=out_buf.read(),
+            media_type="application/zip",
+            headers={
+                "X-Images-Processed": str(len(image_entries)),
+                "X-Errors": str(errors_count),
+                "X-Processing-Time": f"{elapsed:.2f}",
+            },
+        )
+
+    @app.post("/process_ocr_zip")
+    async def process_ocr_zip(
+        file: UploadFile = File(..., description="ZIP file containing manga images"),
+        lang: str = "auto",
+        remove_sfx: bool = False,
+        connected_slashes: bool = False,
+        _key: str = Depends(verify_key_dep),
+    ):
+        content = await file.read()
+        if len(content) > MAX_ZIP_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"ZIP too large (max {MAX_ZIP_MB} MB)")
+
+        try:
+            in_zip = zipfile.ZipFile(io.BytesIO(content))
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Invalid or corrupt ZIP file")
+
+        image_entries = sorted([n for n in in_zip.namelist() if Path(n).suffix.lower() in SUPPORTED_EXTS])
+        if not image_entries:
+            raise HTTPException(status_code=400, detail="No supported images found in ZIP")
+        raw_images = [in_zip.read(name) for name in image_entries]
+        log.info("Processing OCR batch of %d images with language: %s, remove_sfx: %s, connected_slashes: %s...", len(raw_images), lang, remove_sfx, connected_slashes)
+        ocr_results = process_ocr_batch(raw_images, lang=lang, remove_sfx=remove_sfx, connected_slashes=connected_slashes)
+        return {"pages": ocr_results}
+
+    return app
+
+
+gr.routes.App.create_app = patched_create_app
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Launch Application (Module level for HF Spaces)
+# Disable SSR mode to prevent Node.js proxy server conflicts
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if __name__ == "__main__":
+    demo.queue()
+    demo.launch(ssr_mode=False)
