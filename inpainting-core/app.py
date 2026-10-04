@@ -837,6 +837,142 @@ def _build_comic_detector_mask(image_bgr: np.ndarray) -> np.ndarray:
     return hybrid_mask
 
 
+# ──────────────────────────────────────────────
+# Text Detector (RT-DETR-v2) — كاشف إضافي عالي الدقة يُميّز نص الفقاعة والنص الحر
+# ──────────────────────────────────────────────
+# الكواشف الحالية (YOLO + ComicTextDetector) تُنتج أقنعة بكسلية لكنها تُخطئ أحياناً
+# (نص مفقود = شبح داخل الفقاعة | أو "نص" مزيّف فوق الرسم = أكل الشخصية). هذا الكاشف
+# مستقل عنهما، فنستخدمه كـ"شاهد ثانٍ" (ensemble agreement):
+#   1) الدقة: أي منطقة حساسة (فوق الرسم) لا يؤكدها الكاشف تُستبعد → حماية الشخصيات.
+#   2) الاسترجاع: أي صندوق نص يؤكده الكاشف ولم تغطّه الأقنعة الحالية → نضيف حبره فقط.
+# مُعدّ بالكامل بالـ env، وتحميله كسول وغير حاسم (لو فشل يرجع السلوك القديم تماماً).
+USE_TEXT_DET   = os.getenv("USE_TEXT_DET", "1") == "1"
+TEXT_DET_REPO  = os.getenv("TEXT_DET_REPO", "ogkalu/comic-text-and-bubble-detector")
+TEXT_DET_CONF  = float(os.getenv("TEXT_DET_CONF", "0.35"))
+text_det_model = None
+text_det_processor = None
+_text_det_failed = False
+
+
+def ensure_text_det_loaded() -> bool:
+    """تحميل كسول للكاشف. يُرجع True لو جاهز. أي فشل يُسجَّل مرة واحدة ولا يُعاد."""
+    global text_det_model, text_det_processor, _text_det_failed
+    if text_det_model is not None:
+        return True
+    if _text_det_failed or not USE_TEXT_DET:
+        return False
+    try:
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
+        log.info("Loading text detector %s ...", TEXT_DET_REPO)
+        text_det_processor = AutoImageProcessor.from_pretrained(TEXT_DET_REPO)
+        model = AutoModelForObjectDetection.from_pretrained(TEXT_DET_REPO).eval()
+        if torch.cuda.is_available():
+            model = model.to("cuda")
+        text_det_model = model
+        log.info("Text detector loaded. labels=%s", model.config.id2label)
+        return True
+    except Exception as exc:
+        _text_det_failed = True
+        log.error("Text detector load failed (non-fatal, falling back to legacy detectors): %s", exc)
+        return False
+
+
+def _detect_text_boxes(image_bgr: np.ndarray) -> list:
+    """يُرجع [(x0,y0,x1,y1,label,score)] لصناديق النص (text_bubble/text_free).
+    الصفحات الطويلة (webtoon) تُقطَّع لشرائح متداخلة حتى لا يضيع النص الصغير عند
+    تصغير الصورة بالكامل لمدخل الموديل."""
+    if not ensure_text_det_loaded():
+        return []
+    try:
+        from PIL import Image
+        h, w = image_bgr.shape[:2]
+        tile_h = int(max(w * 1.25, 900))
+        overlap = 120
+        starts = list(range(0, max(1, h - overlap), max(1, tile_h - overlap)))
+        id2label = text_det_model.config.id2label
+        dev = next(text_det_model.parameters()).device
+        boxes = []
+        for y0t in starts:
+            y1t = min(h, y0t + tile_h)
+            tile = image_bgr[y0t:y1t]
+            if tile.shape[0] < 32:
+                continue
+            pil = Image.fromarray(cv2.cvtColor(tile, cv2.COLOR_BGR2RGB))
+            inputs = text_det_processor(images=pil, return_tensors="pt")
+            inputs = {k: v.to(dev) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = text_det_model(**inputs)
+            res = text_det_processor.post_process_object_detection(
+                outputs, target_sizes=[(tile.shape[0], w)], threshold=TEXT_DET_CONF
+            )[0]
+            for score, label, box in zip(res["scores"], res["labels"], res["boxes"]):
+                name = str(id2label.get(int(label), "")).lower()
+                if "text" not in name:
+                    continue  # "bubble" وحده = حدود الفقاعة لا النص
+                bx0, by0, bx1, by1 = [float(v) for v in box.tolist()]
+                x0, x1 = max(0, int(round(bx0))), min(w, int(round(bx1)))
+                y0, y1 = max(0, int(round(by0)) + y0t), min(h, int(round(by1)) + y0t)
+                if x1 - x0 < 4 or y1 - y0 < 4:
+                    continue
+                boxes.append((x0, y0, x1, y1, name, float(score)))
+        return boxes
+    except Exception as exc:
+        log.warning("Text detector inference failed (ignored for this image): %s", exc)
+        return []
+
+
+def _boxes_to_mask(boxes: list, h: int, w: int, pad: int = 4) -> np.ndarray:
+    m = np.zeros((h, w), dtype=np.uint8)
+    for x0, y0, x1, y1, *_ in boxes:
+        cv2.rectangle(m, (max(0, x0 - pad), max(0, y0 - pad)), (min(w - 1, x1 + pad), min(h - 1, y1 + pad)), 255, -1)
+    return m
+
+
+def _filter_by_detector(mask: np.ndarray, box_mask: np.ndarray, min_overlap: float = 0.10):
+    """يُبقي فقط القطع التي يؤكدها الكاشف (تداخل ≥ min_overlap من مساحة القطعة).
+    يُرجع (القناع المفلتر، عدد القطع المستبعدة)."""
+    if mask is None or mask.max() == 0:
+        return mask, 0
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    keep = np.zeros_like(mask)
+    dropped = 0
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < 1:
+            continue
+        comp = labels == i
+        overlap = int(np.count_nonzero(box_mask[comp]))
+        if overlap / float(area) >= min_overlap:
+            keep[comp] = 255
+        else:
+            dropped += 1
+    return keep, dropped
+
+
+def _add_missed_text(image_bgr: np.ndarray, refined_mask: np.ndarray, boxes: list, iterations: int) -> int:
+    """لكل صندوق نص يؤكده الكاشف وتغطيته بالقناع الحالي < 15%، نُضيف حبر النص فقط
+    (adaptive threshold) لا الصندوق كاملاً. يعدّل refined_mask في مكانه ويُرجع العدد."""
+    added = 0
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    for x0, y0, x1, y1, *_ in boxes:
+        area = (x1 - x0) * (y1 - y0)
+        if area <= 0:
+            continue
+        if cv2.countNonZero(refined_mask[y0:y1, x0:x1]) / float(area) >= 0.15:
+            continue
+        crop = image_bgr[y0:y1, x0:x1]
+        full = np.full(crop.shape[:2], 255, dtype=np.uint8)
+        precise = _extract_precise_text_mask(crop, full, C_CONSTANT)
+        density = cv2.countNonZero(precise) / float(full.size)
+        if density > 0.6 or density < 0.01:
+            continue  # إما رجع الصندوق كاملاً (لا حبر واضح) أو لا شيء → لا نخاطر
+        if iterations > 0:
+            precise = cv2.dilate(precise, k, iterations=iterations)
+        refined_mask[y0:y1, x0:x1] = cv2.bitwise_or(refined_mask[y0:y1, x0:x1], precise)
+        added += 1
+    return added
+
+
 def _dilation_iterations(dilate_iter: int) -> int:
     """يحوّل قيمة dilate_iter (1-15 من سلايدر البوت/الـ Space) إلى عدد مرات توسيع فعلي.
     القيمة الافتراضية 3 تُعطي iterations=1 (تطابق تماماً السلوك القديم قبل هذا التعديل
@@ -1225,6 +1361,10 @@ def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bo
     # مناطق آمنة معروفة (داخل فقاعات كلام حقيقية + صناديق نظام) — تُستخدم لبوابة
     # الـSFX ولاحقاً لفرز المناطق الآمنة عن الحساسة في الخطوة 5
     bubble_interior = _build_bubble_interior_mask(image_bgr)
+
+    # كاشف RT-DETR الإضافي: شاهد ثانٍ للدقة (حماية الرسم) والاسترجاع (النص المفقود)
+    det_boxes = _detect_text_boxes(image_bgr)
+    det_box_mask = _boxes_to_mask(det_boxes, h, w) if det_boxes else None
     panel_interior = (
         _find_system_panel_interior(image_bgr, comic_mask)
         if comic_mask.max() > 0
@@ -1374,12 +1514,26 @@ def _build_text_mask(image_bgr: np.ndarray, dilate_iter: int = 3, remove_sfx: bo
     # بالكامل، ثم هالة صغيرة بقوة dilate_iter فقط — حماية مباشرة لرسم الشخصية
     # المجاور بدل مستطيل قد يبتلع جزءاً من الوجه/اليد.
     complex_guard_mask = np.zeros_like(mask)
+    det_dropped = 0
+    if det_box_mask is not None and complex_mask.max() > 0:
+        # منطقة حساسة لا يؤكدها الكاشف = غالباً رسم/خطوط وليس نصاً → لا نلمسها
+        complex_mask, det_dropped = _filter_by_detector(complex_mask, det_box_mask)
     if complex_mask.max() > 0:
         precise = _extract_precise_text_mask(image_bgr, complex_mask, C_CONSTANT)
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         precise_dilated = precise if iterations <= 0 else cv2.dilate(precise, k, iterations=iterations)
         refined_mask = cv2.bitwise_or(refined_mask, precise_dilated)
         complex_guard_mask = precise_dilated
+
+    det_added = 0
+    if det_boxes:
+        # استرجاع: صناديق نص مؤكدة لم تغطّها الأقنعة. بدون remove_sfx نكتفي بنص الفقاعات
+        # (text_bubble) حتى لا يتجاوز النص الحر/الـSFX قرار المستخدم.
+        recall_boxes = det_boxes if remove_sfx else [b for b in det_boxes if "bubble" in b[4]]
+        det_added = _add_missed_text(image_bgr, refined_mask, recall_boxes, iterations)
+    if det_boxes:
+        log.info("TextDet: %d boxes | complex regions dropped=%d | missed text added=%d",
+                 len(det_boxes), det_dropped, det_added)
 
     # Re-apply scanlation watermark filter to ensure credit badge safety
     refined_mask = _filter_scanlation_watermarks(refined_mask, w, h)
@@ -1924,4 +2078,9 @@ gr.routes.App.create_app = patched_create_app
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(ssr_mode=False)
+    # على Colab (أو GRADIO_SHARE=1) نفعّل share=True ليطلع رابط عام https://xxxx.gradio.live
+    # يقدر البوت (على Railway) يوصله — بدونه الرابط يبقى محلي داخل Colab فقط.
+    _share = "COLAB_RELEASE_TAG" in os.environ or os.getenv("GRADIO_SHARE") == "1"
+    if _share:
+        log.info("Colab/share mode ON — انسخ رابط gradio.live اللي هيظهر تحت وحطه في INPAINTING_SPACE_URL.")
+    demo.launch(ssr_mode=False, share=_share, server_name="0.0.0.0" if _share else None)
