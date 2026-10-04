@@ -260,8 +260,26 @@ sd_pipe = None   # StableDiffusionInpaintPipeline for background reconstruction
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Model Loading Helper (Lazy Loading on First Use)
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def _check_ort_gpu(name: str, session) -> None:
+    """يسجّل الـ providers الفعلية، وينبّه بوضوح لو onnxruntime وقع على CPU رغم وجود GPU
+    (ده اللي بيخلّي LaMa/ComicTextDetector بطيئين جداً بينما YOLO شغال على GPU)."""
+    provs = session.get_providers()
+    log.info("%s providers (actual): %s", name, provs)
+    if torch.cuda.is_available() and "CUDAExecutionProvider" not in provs:
+        log.warning(
+            "%s اشتغل على CPU رغم وجود GPU! السبب غالباً إن onnxruntime مش شايف مكتبات CUDA12/cuDNN9 "
+            "(راجع سطر 'Failed to create CUDAExecutionProvider' فوق ده في اللوج — بيذكر اسم المكتبة الناقصة).",
+            name,
+        )
+
+
 def ensure_models_loaded():
     global yolo_model, comic_det_session, lama_session, aot_model, bubble_seg_model, sd_pipe
+    if hasattr(ort, "preload_dlls"):  # onnxruntime >= 1.21: يحمّل CUDA/cuDNN من حزم pip nvidia-*
+        try:
+            ort.preload_dlls()
+        except Exception as exc:
+            log.warning("ort.preload_dlls failed: %s", exc)
 
     if yolo_model is None:
         log.info("Loading YOLOv8 text segmenter …")
@@ -290,7 +308,7 @@ def ensure_models_loaded():
             comic_det_session = ort.InferenceSession(
                 det_path, sess_options=sess_opts, providers=providers
             )
-            log.info("ComicTextDetector loaded — providers: %s", comic_det_session.get_providers())
+            _check_ort_gpu("ComicTextDetector", comic_det_session)
         except Exception as exc:
             log.error("ComicTextDetector load failed: %s", exc)
 
@@ -307,7 +325,7 @@ def ensure_models_loaded():
             lama_session = ort.InferenceSession(
                 lama_path, sess_options=sess_opts, providers=providers
             )
-            log.info("LaMa ONNX loaded — providers: %s", lama_session.get_providers())
+            _check_ort_gpu("LaMa ONNX", lama_session)
         except Exception as exc:
             log.error("LaMa load failed: %s", exc)
 
